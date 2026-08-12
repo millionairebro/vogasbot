@@ -34,9 +34,10 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_abi import encode as abi_encode
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters,
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters,
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s | %(message)s", level=logging.INFO)
@@ -140,6 +141,8 @@ STATE = {
     "copy_target":  None,
     "seadrop":      False,
     "seadrop_collection": None,
+    "pending":      {},
+    "pending_seq":  0,
 }
 
 _SUBMIT = None
@@ -984,24 +987,46 @@ def build_custom_tx(_w3, wal, to, data, value, nonce=None):
     }
 
 
-async def fire_custom_all(update, to, data, value):
+def copy_wallet_calldata(to, data, wal):
+    # if the target used OpenSea SeaDrop mintPublic, rebuild with OUR wallet as minter
+    body = data[2:] if data.startswith("0x") else data
+    if (to.lower() == SEADROP_ADDR.lower()
+            and body[:8].lower() == selector("mintPublic(address,address,address,uint256)")):
+        collection = Web3.to_checksum_address("0x" + body[8:72][24:])
+        return seadrop_calldata(collection, wal["address"], wal["qty"] or STATE["qty"])
+    return data if data.startswith("0x") else "0x" + data
+
+
+async def copy_confirm(context, chat_id, _w3, txh, name):
+    try:
+        r = await run_blocking(_w3.eth.wait_for_transaction_receipt, txh, 90)
+        ok = r.get("status") == 1
+        await context.bot.send_message(
+            chat_id, f"[{name}] " + ("CONFIRMED" if ok else "reverted") + f" | block {r.get('blockNumber')}")
+    except Exception:
+        await context.bot.send_message(chat_id, f"[{name}] not confirmed in 90s - check the explorer")
+
+
+async def copy_fire(context, chat_id, to, data, value):
     _w3 = w3()
     _sw = submit_w3()
+    await context.bot.send_message(chat_id, f"Minting from {len(STATE['wallets'])} wallets -> {to[:10]}..")
 
     async def one(wal):
         try:
-            tx = await run_blocking(build_custom_tx, _w3, wal, to, data, value)
+            cd = copy_wallet_calldata(to, data, wal)
+            tx = await run_blocking(build_custom_tx, _w3, wal, to, cd, value)
             raw = sign_wallet(_w3, wal, tx)
             txh = await run_blocking(do_send, _sw, raw)
-            asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
-            return f"[{wal['name']}] SENT {txh}"
+            await context.bot.send_message(chat_id, f"[{wal['name']}] minting.. SENT {txh}\n{EXPLORER}/tx/{txh}")
+            asyncio.create_task(copy_confirm(context, chat_id, _w3, txh, wal["name"]))
         except Exception as e:
-            return f"[{wal['name']}] fail {str(e)[:60]}"
+            await context.bot.send_message(chat_id, f"[{wal['name']}] fail {str(e)[:80]}")
 
-    return await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+    await asyncio.gather(*[one(w) for w in STATE["wallets"]])
 
 
-async def _copy_loop(update, target, interval):
+async def _copy_loop(context, chat_id, target, interval):
     seen = set()
     try:
         for t in await run_blocking(fetch_txlist, target, 10):
@@ -1009,11 +1034,11 @@ async def _copy_loop(update, target, interval):
                 seen.add(t["hash"])
     except Exception:
         pass
-    await update.message.reply_text(
+    await context.bot.send_message(
+        chat_id,
         f"Copy-mint watching {target}\n"
-        "When it mints, all your wallets replicate the same call. Works for simple mints "
-        "(their proof/signature won't transfer to your wallets). No mempool here, so you follow "
-        "AFTER their tx lands - you can't beat them. /cancel to stop."
+        "FREE mints fire instantly in the background. PAID mints ask for your approval (buttons). "
+        "Always watching until /cancel. (No mempool here, so you follow after their tx lands.)"
     )
     while True:
         try:
@@ -1035,10 +1060,55 @@ async def _copy_loop(update, target, interval):
                 continue
             to = Web3.to_checksum_address(to)
             val = int(t.get("value") or "0")
-            await update.message.reply_text(f"Copy: target minted {to[:10]}.. -> replicating from all wallets")
-            res = await fire_custom_all(update, to, data, val)
-            await update.message.reply_text("\n".join(res))
+            if val == 0:
+                await context.bot.send_message(chat_id, f"Copy: target FREE-minted {to[:10]}.. -> firing all wallets")
+                asyncio.create_task(copy_fire(context, chat_id, to, data, val))
+            else:
+                pid = str(STATE["pending_seq"])
+                STATE["pending_seq"] += 1
+                price = Decimal(val) / Decimal(10 ** 18)
+                STATE["pending"][pid] = {"to": to, "data": data, "value": val, "desc": f"{price} ETH -> {to[:10]}.."}
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
+                    InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}"),
+                ]])
+                await context.bot.send_message(
+                    chat_id,
+                    f"Copy: target minted a PAID drop ({price} ETH) at {to[:10]}..\n"
+                    f"Mint from your {len(STATE['wallets'])} wallets?",
+                    reply_markup=kb,
+                )
         await asyncio.sleep(interval)
+
+
+async def cb_handler(update, context):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if OWNER_ID and q.from_user and q.from_user.id != OWNER_ID:
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) == 3 and parts[0] == "cp":
+        action, pid = parts[1], parts[2]
+        pend = STATE["pending"].pop(pid, None)
+        if not pend:
+            try:
+                await q.edit_message_text("This request was already handled or expired.")
+            except Exception:
+                pass
+            return
+        if action == "s":
+            try:
+                await q.edit_message_text(f"Skipped: {pend['desc']}")
+            except Exception:
+                pass
+            return
+        try:
+            await q.edit_message_text(f"Approved: {pend['desc']} - minting...")
+        except Exception:
+            pass
+        await copy_fire(context, q.message.chat_id, pend["to"], pend["data"], pend["value"])
 
 
 @owner_only
@@ -1064,7 +1134,7 @@ async def copy_cmd(update, context):
         except ValueError:
             pass
     STATE["copy_target"] = target
-    STATE["copy_task"] = asyncio.create_task(_copy_loop(update, target, interval))
+    STATE["copy_task"] = asyncio.create_task(_copy_loop(context, update.effective_chat.id, target, interval))
 
 
 async def guard_msg(update, context):
@@ -1104,6 +1174,7 @@ def main():
         ("setgas", setgas_cmd), ("copy", copy_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard_msg))
 
     log.info("Bot up. owner=%s chain=%s wallets=%d rpc=%s submit=%s",

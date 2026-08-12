@@ -88,6 +88,39 @@ def get_code(_w3, addr):
     h = _w3.eth.get_code(addr).hex()
     return h if h.startswith("0x") else "0x" + h
 
+
+# OpenSea SeaDrop (mints route through this contract, not the NFT contract)
+SEADROP_ADDR = Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
+OPENSEA_FEE_RECIPIENT = Web3.to_checksum_address("0x0000a26b00c1F0DF003000390027140000fAa719")
+SEADROP_ABI = [{
+    "inputs": [{"name": "nftContract", "type": "address"}],
+    "name": "getPublicDrop",
+    "outputs": [{"components": [
+        {"name": "mintPrice", "type": "uint80"},
+        {"name": "startTime", "type": "uint48"},
+        {"name": "endTime", "type": "uint48"},
+        {"name": "maxTotalMintableByWallet", "type": "uint16"},
+        {"name": "feeBps", "type": "uint16"},
+        {"name": "restrictFeeRecipients", "type": "bool"},
+    ], "name": "", "type": "tuple"}],
+    "stateMutability": "view", "type": "function",
+}]
+
+
+def read_public_drop(_w3, collection):
+    c = _w3.eth.contract(address=SEADROP_ADDR, abi=SEADROP_ABI)
+    return c.functions.getPublicDrop(Web3.to_checksum_address(collection)).call()
+
+
+def seadrop_calldata(collection, minter, qty):
+    sel = selector("mintPublic(address,address,address,uint256)")
+    enc = abi_encode(
+        ["address", "address", "address", "uint256"],
+        [Web3.to_checksum_address(collection), OPENSEA_FEE_RECIPIENT,
+         Web3.to_checksum_address(minter), int(qty)],
+    ).hex()
+    return "0x" + sel + enc
+
 # ------------------------------------------------------------------ state
 STATE = {
     "wallets":      [],     # list of {name,key,account,address,qty,value_wei,calldata,armed,armed_nonce}
@@ -105,6 +138,8 @@ STATE = {
     "gas_limit_override": None,
     "copy_task":    None,
     "copy_target":  None,
+    "seadrop":      False,
+    "seadrop_collection": None,
 }
 
 _SUBMIT = None
@@ -176,6 +211,8 @@ def wallet_value(wal):
 def wallet_calldata(_w3, wal):
     if wal["calldata"]:
         return wal["calldata"]
+    if STATE.get("seadrop"):
+        return seadrop_calldata(STATE["seadrop_collection"], wal["address"], wal["qty"] or STATE["qty"])
     if not STATE["fn"]:
         raise ValueError("no mint function set - run /source, or add per-wallet calldata")
     inputs = STATE["fn_inputs"] or []
@@ -429,7 +466,7 @@ async def source_cmd(update, context):
     if not addr:
         await update.message.reply_text(note)
         return
-    STATE.update(contract=addr, abi=None, fn=None, fn_inputs=None)
+    STATE.update(contract=addr, abi=None, fn=None, fn_inputs=None, seadrop=False, seadrop_collection=None)
     for wal in STATE["wallets"]:
         wal["armed"] = None
     msg = [f"Contract: {addr}  ({note})"]
@@ -463,8 +500,25 @@ async def source_cmd(update, context):
                        "That proof is issued by the project per wallet; no bot can invent it. "
                        "Put each wallet's calldata in wallets.json.")
         else:
-            msg.append("Unverified and no known mint selector in the bytecode. Capture the calldata "
-                       "from a real mint tx (MetaMask Hex view, or a mint tx on Blockscout) -> wallets.json.")
+            pd = None
+            try:
+                pd = await run_blocking(read_public_drop, _w3, addr)
+            except Exception:
+                pd = None
+            if pd and (int(pd[3]) > 0 or int(pd[2]) > 0):
+                STATE["seadrop"] = True
+                STATE["seadrop_collection"] = addr
+                STATE["contract"] = SEADROP_ADDR
+                STATE["value_wei"] = int(pd[0])
+                price_eth = Decimal(int(pd[0])) / Decimal(10 ** 18)
+                msg.append("This is an OpenSea SeaDrop mint - it routes through the SeaDrop contract, "
+                           "not the collection. I'll build mintPublic calldata for ALL your wallets "
+                           "automatically (each with its own minter address).")
+                msg.append(f"Public price {price_eth} ETH, max {int(pd[3])}/wallet.")
+                msg.append("Next: /simall -> /armall -> /autoall or /scheduleall.")
+            else:
+                msg.append("Unverified and no known mint selector in the bytecode. Capture the calldata "
+                           "from a real mint tx (MetaMask Hex view, or a mint tx on Blockscout) -> wallets.json.")
         await update.message.reply_text("\n".join(msg))
         return
     STATE["abi"] = abi
@@ -559,6 +613,8 @@ async def status_cmd(update, context):
     lines.append(f"Submit: {SUBMIT_RPC_URL}")
     lines.append(f"Wallets: {len(STATE['wallets'])}")
     lines.append(f"Contract: {STATE['contract'] or '-'}")
+    if STATE.get("seadrop"):
+        lines.append(f"SeaDrop: {STATE['seadrop_collection']}")
     if STATE["fn"]:
         lines.append(f"Mint fn: {STATE['fn']}({','.join(STATE['fn_inputs'] or [])})")
     else:

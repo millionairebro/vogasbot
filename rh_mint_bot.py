@@ -137,8 +137,8 @@ STATE = {
     "gas_max_fee":  None,
     "gas_priority": None,
     "gas_limit_override": None,
-    "copy_task":    None,
-    "copy_target":  None,
+    "copy_tasks":   {},
+    "awaiting_copy": False,
     "seadrop":      False,
     "seadrop_collection": None,
     "pending":      {},
@@ -400,7 +400,7 @@ def owner_only(fn):
         uid = update.effective_user.id if update.effective_user else None
         if OWNER_ID and uid != OWNER_ID:
             if update.message:
-                await update.message.reply_text("Unauthorized.")
+                await update.effective_message.reply_text("Unauthorized.")
             log.warning("Rejected command from user %s", uid)
             return
         return await fn(update, context)
@@ -410,7 +410,7 @@ def owner_only(fn):
 # ------------------------------------------------------------------ commands
 @owner_only
 async def start_cmd(update, context):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "Robinhood Chain MULTI-WALLET mint bot - self-hosted.\n\n"
         "Keys live in wallets.json on this machine only, never in chat. Only your Telegram ID "
         "can command this bot. FCFS chain: pre-signed + closest-to-sequencer wins, not gas.\n\n"
@@ -422,7 +422,7 @@ async def start_cmd(update, context):
 
 @owner_only
 async def help_cmd(update, context):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "SETUP\n"
         "/wallets - list your wallets + balances\n"
         "/source <opensea link | 0xcontract> - resolve contract, ABI, mint fn, price\n"
@@ -441,7 +441,11 @@ async def help_cmd(update, context):
         "/newwallet [n] - create n new wallets\n"
         "/importwallet 0xKEY - add an existing wallet\n"
         "/setgas <maxFeeGwei> [prioGwei] [gasLimit] - gas override (auto resets)\n"
-        "/copy 0xADDR [sec] - copy-mint a target wallets mints"
+        "/copy 0xADDR [sec] - copy-mint a target wallets mints\n"
+        "/stopwatch - stop auto/scheduled mint only\n"
+        "/stopcopy - stop copy-mint only\n"
+        "/copywatch - view/manage copy watchlist (buttons)\n"
+        "(tip: just paste a contract/OS link - no /source needed)"
     )
 
 
@@ -457,111 +461,135 @@ async def wallets_cmd(update, context):
                          f"{Decimal(bal)/Decimal(10**18):.5f} ETH  qty {wal['qty']}  {tag}")
         except Exception:
             lines.append(f"[{wal['name']}] {wal['address'][:8]}..  RPC err  {tag}")
-    await update.message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text("\n".join(lines))
 
 
-@owner_only
-async def source_cmd(update, context):
-    if not context.args:
-        await update.message.reply_text("Usage: /source <opensea link or 0xcontract>")
-        return
-    addr, note = resolve_source(" ".join(context.args))
+def action_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Simulate", callback_data="act|sim"),
+         InlineKeyboardButton("Arm", callback_data="act|arm")],
+        [InlineKeyboardButton("MINT ALL NOW", callback_data="act|mint"),
+         InlineKeyboardButton("Auto-mint", callback_data="act|auto")],
+    ])
+
+
+def read_name(_w3, addr):
+    try:
+        c = _w3.eth.contract(
+            address=Web3.to_checksum_address(addr),
+            abi=[{"inputs": [], "name": "name", "outputs": [{"type": "string"}],
+                  "stateMutability": "view", "type": "function"}])
+        return c.functions.name().call()
+    except Exception:
+        return None
+
+
+async def _try_seadrop(_w3, addr, msg):
+    try:
+        pd = await run_blocking(read_public_drop, _w3, addr)
+    except Exception:
+        pd = None
+    if pd and (int(pd[3]) > 0 or int(pd[2]) > 0):
+        STATE["seadrop"] = True
+        STATE["seadrop_collection"] = addr
+        STATE["contract"] = SEADROP_ADDR
+        STATE["value_wei"] = int(pd[0])
+        msg.append(f"OpenSea SeaDrop mint - price {Decimal(int(pd[0]))/Decimal(10**18)} ETH, "
+                   f"max {int(pd[3])}/wallet. Calldata auto-built for every wallet.")
+        return True
+    return False
+
+
+async def do_source(update, context, text):
+    reply = update.effective_message.reply_text
+    addr, note = resolve_source(text)
     if not addr:
-        await update.message.reply_text(note)
+        await reply(note)
         return
     STATE.update(contract=addr, abi=None, fn=None, fn_inputs=None, seadrop=False, seadrop_collection=None)
     for wal in STATE["wallets"]:
         wal["armed"] = None
-    msg = [f"Contract: {addr}  ({note})"]
     _w3 = w3()
+    name = await run_blocking(read_name, _w3, addr)
+    msg = [f"Collection: {name}" if name else "Collection: (unnamed)", f"Contract: {addr}"]
+    mintable = False
     try:
         abi = await run_blocking(fetch_abi, addr)
     except Exception:
         abi = None
-    if not abi:
+    if abi:
+        STATE["abi"] = abi
+        fns = detect_mint_fns(abi)
+        if fns:
+            try:
+                pg, pv = await run_blocking(read_price, _w3, addr, abi)
+            except Exception:
+                pg, pv = None, None
+            if pv is not None:
+                STATE["value_wei"] = pv
+                msg.append(f"Price: {Decimal(pv)/Decimal(10**18)} ETH")
+            top_nm, top_inp = fns[0]
+            simple = (len(top_inp) == 0
+                      or (len(top_inp) == 1 and top_inp[0].startswith("uint"))
+                      or (len(top_inp) == 2 and top_inp[0] == "address" and top_inp[1].startswith("uint")))
+            if simple:
+                STATE["fn"], STATE["fn_inputs"] = top_nm, top_inp
+                msg.append(f"SIMPLE mint {top_nm}({','.join(top_inp)}) - calldata auto-built for all wallets.")
+                mintable = True
+            else:
+                msg.append(f"WHITELIST mint {top_nm}({','.join(top_inp)}) - needs each wallet's calldata "
+                           "(proof issued by the project).")
+        else:
+            mintable = await _try_seadrop(_w3, addr, msg)
+            if not mintable:
+                msg.append("No mint function in the ABI. Capture calldata from a real mint tx -> wallets.json.")
+    else:
         try:
             code = await run_blocking(get_code, _w3, addr)
         except Exception:
             code = "0x"
         hexcode = code[2:].lower() if code else ""
         if not hexcode:
-            msg.append("No contract code at that address - double-check it's the mint contract.")
-            await update.message.reply_text("\n".join(msg))
-            return
-        found_simple = [s for s in SIMPLE_SIGS if ("63" + selector(s)) in hexcode]
-        found_proof = [s for s in PROOF_SIGS if ("63" + selector(s)) in hexcode]
-        if found_simple:
-            sig = found_simple[0]
-            STATE["fn"], STATE["fn_inputs"] = sig.split("(")[0], sig_types(sig)
-            msg.append(f"Unverified, but I read the bytecode: found {sig} - SIMPLE mint. "
-                       "I'll build calldata for all wallets automatically.")
-            if found_proof:
-                msg.append("(bytecode also has: " + ", ".join(found_proof) + ")")
-            msg.append("Next: /setqty if needed -> /simall -> /armall -> /autoall.")
-        elif found_proof:
-            msg.append(f"Unverified; bytecode shows {found_proof[0]} - a PROOF/signature whitelist. "
-                       "That proof is issued by the project per wallet; no bot can invent it. "
-                       "Put each wallet's calldata in wallets.json.")
+            msg.append("No contract code at that address - double-check it.")
         else:
-            pd = None
-            try:
-                pd = await run_blocking(read_public_drop, _w3, addr)
-            except Exception:
-                pd = None
-            if pd and (int(pd[3]) > 0 or int(pd[2]) > 0):
-                STATE["seadrop"] = True
-                STATE["seadrop_collection"] = addr
-                STATE["contract"] = SEADROP_ADDR
-                STATE["value_wei"] = int(pd[0])
-                price_eth = Decimal(int(pd[0])) / Decimal(10 ** 18)
-                msg.append("This is an OpenSea SeaDrop mint - it routes through the SeaDrop contract, "
-                           "not the collection. I'll build mintPublic calldata for ALL your wallets "
-                           "automatically (each with its own minter address).")
-                msg.append(f"Public price {price_eth} ETH, max {int(pd[3])}/wallet.")
-                msg.append("Next: /simall -> /armall -> /autoall or /scheduleall.")
+            found_simple = [s for s in SIMPLE_SIGS if ("63" + selector(s)) in hexcode]
+            found_proof = [s for s in PROOF_SIGS if ("63" + selector(s)) in hexcode]
+            if found_simple:
+                sig = found_simple[0]
+                STATE["fn"], STATE["fn_inputs"] = sig.split("(")[0], sig_types(sig)
+                msg.append(f"Unverified; bytecode shows {sig} - SIMPLE mint, calldata auto-built.")
+                mintable = True
+            elif found_proof:
+                msg.append(f"Unverified; bytecode shows {found_proof[0]} - PROOF/whitelist. "
+                           "Needs per-wallet calldata.")
             else:
-                msg.append("Unverified and no known mint selector in the bytecode. Capture the calldata "
-                           "from a real mint tx (MetaMask Hex view, or a mint tx on Blockscout) -> wallets.json.")
-        await update.message.reply_text("\n".join(msg))
-        return
-    STATE["abi"] = abi
-    fns = detect_mint_fns(abi)
-    if not fns:
-        msg.append("No mint-like function in the ABI (could be a SeaDrop/proxy). Use per-wallet calldata.")
-        await update.message.reply_text("\n".join(msg))
-        return
-    try:
-        pg, pv = await run_blocking(read_price, _w3, addr, abi)
-    except Exception:
-        pg, pv = None, None
-    if pv is not None:
-        STATE["value_wei"] = pv
-        msg.append(f"Price {pg}() = {Decimal(pv)/Decimal(10**18)} ETH (set as value).")
-    msg.append("mint fns: " + ", ".join(f"{n}({','.join(inp)})" for n, inp in fns[:6]))
-    top_nm, top_inp = fns[0]
-    simple = (len(top_inp) == 0
-              or (len(top_inp) == 1 and top_inp[0].startswith("uint"))
-              or (len(top_inp) == 2 and top_inp[0] == "address" and top_inp[1].startswith("uint")))
-    if simple:
-        STATE["fn"], STATE["fn_inputs"] = top_nm, top_inp
-        msg.append(f"Auto-selected {top_nm}({','.join(top_inp)}) - SIMPLE mint. "
-                   "I'll build calldata for all wallets automatically.")
-        msg.append("Next: /setqty if needed -> /simall -> /armall -> /autoall or /scheduleall.")
+                mintable = await _try_seadrop(_w3, addr, msg)
+                if not mintable:
+                    msg.append("No known mint selector. Capture calldata from a real mint tx -> wallets.json.")
+    if mintable:
+        msg.append(f"{len(STATE['wallets'])} wallets | qty {STATE['qty']}. Tap to act:")
+        await reply("\n".join(msg), reply_markup=action_kb())
     else:
-        msg.append(f"Top fn {top_nm}({','.join(top_inp)}) takes a proof/signature - WHITELIST. "
-                   "I cannot invent proofs. Put each wallet's calldata (from the project's mint "
-                   "page/API) in wallets.json under 'calldata'. Then /simall + /autoall work per wallet.")
-    await update.message.reply_text("\n".join(msg))
+        await reply("\n".join(msg))
+
+
+@owner_only
+async def source_cmd(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /source <opensea link or 0xcontract> - or just paste the address, no command needed.")
+        return
+    await do_source(update, context, " ".join(context.args))
 
 
 @owner_only
 async def setfn_cmd(update, context):
     if not STATE["abi"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     if not context.args:
         fns = detect_mint_fns(STATE["abi"])
-        await update.message.reply_text("Pick: " + ", ".join(f"{n}({','.join(inp)})" for n, inp in fns))
+        await update.effective_message.reply_text("Pick: " + ", ".join(f"{n}({','.join(inp)})" for n, inp in fns))
         return
     name = context.args[0]
     for i in STATE["abi"]:
@@ -570,39 +598,39 @@ async def setfn_cmd(update, context):
             STATE["fn_inputs"] = [a["type"] for a in i.get("inputs", [])]
             for wal in STATE["wallets"]:
                 wal["armed"] = None
-            await update.message.reply_text(f"Mint fn set: {name}({','.join(STATE['fn_inputs'])})")
+            await update.effective_message.reply_text(f"Mint fn set: {name}({','.join(STATE['fn_inputs'])})")
             return
-    await update.message.reply_text("No such function in the ABI.")
+    await update.effective_message.reply_text("No such function in the ABI.")
 
 
 @owner_only
 async def setqty_cmd(update, context):
     if not context.args:
-        await update.message.reply_text("Usage: /setqty 2")
+        await update.effective_message.reply_text("Usage: /setqty 2")
         return
     try:
         STATE["qty"] = max(1, int(context.args[0]))
     except ValueError:
-        await update.message.reply_text("bad number")
+        await update.effective_message.reply_text("bad number")
         return
     for wal in STATE["wallets"]:
         wal["armed"] = None
-    await update.message.reply_text(f"Default qty per wallet: {STATE['qty']} (per-wallet qty overrides).")
+    await update.effective_message.reply_text(f"Default qty per wallet: {STATE['qty']} (per-wallet qty overrides).")
 
 
 @owner_only
 async def setvalue_cmd(update, context):
     if not context.args:
-        await update.message.reply_text("Usage: /setvalue 0.05  (price per single mint)")
+        await update.effective_message.reply_text("Usage: /setvalue 0.05  (price per single mint)")
         return
     try:
         STATE["value_wei"] = int(Web3.to_wei(Decimal(context.args[0]), "ether"))
     except Exception:
-        await update.message.reply_text("bad amount")
+        await update.effective_message.reply_text("bad amount")
         return
     for wal in STATE["wallets"]:
         wal["armed"] = None
-    await update.message.reply_text(f"Price/mint: {context.args[0]} ETH (total per wallet = price x qty).")
+    await update.effective_message.reply_text(f"Price/mint: {context.args[0]} ETH (total per wallet = price x qty).")
 
 
 @owner_only
@@ -634,29 +662,26 @@ async def status_cmd(update, context):
         lines.append("Scheduled: no")
     if STATE.get("gas_max_fee"):
         lines.append("Gas override: maxFee " + str(Decimal(STATE["gas_max_fee"]) / Decimal(10**9)) + " gwei")
-    _copy = STATE.get("copy_task")
-    if STATE.get("copy_target") and _copy and not _copy.done():
-        lines.append("Copy-mint: watching " + STATE["copy_target"])
-    else:
-        lines.append("Copy-mint: off")
-    await update.message.reply_text("\n".join(lines))
+    _active = sum(1 for t in STATE["copy_tasks"].values() if t and not t.done())
+    lines.append(f"Copy-mint: {_active} wallet(s) tracked" if _active else "Copy-mint: off")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def _confirm(update, _w3, txh, name):
     try:
         rcpt = await run_blocking(_w3.eth.wait_for_transaction_receipt, txh, 60)
         ok = rcpt.get("status") == 1
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"[{name}] " + ("MINED - success" if ok else "MINED but reverted") + f" | block {rcpt.get('blockNumber')}"
         )
     except Exception:
-        await update.message.reply_text(f"[{name}] not confirmed in 60s - check the explorer.")
+        await update.effective_message.reply_text(f"[{name}] not confirmed in 60s - check the explorer.")
 
 
 @owner_only
 async def simall_cmd(update, context):
     if not STATE["contract"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     _w3 = w3()
 
@@ -668,13 +693,13 @@ async def simall_cmd(update, context):
             return f"[{wal['name']}] not yet: {str(e)[:70]}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
-    await update.message.reply_text("\n".join(["Eligibility (simulation, spends nothing):"] + list(res)))
+    await update.effective_message.reply_text("\n".join(["Eligibility (simulation, spends nothing):"] + list(res)))
 
 
 @owner_only
 async def armall_cmd(update, context):
     if not STATE["contract"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     _w3 = w3()
 
@@ -693,7 +718,7 @@ async def armall_cmd(update, context):
         await run_blocking(lambda: submit_w3().eth.block_number)  # warm submit socket
     except Exception:
         pass
-    await update.message.reply_text("\n".join(["Armed (submit socket warmed):"] + list(res)))
+    await update.effective_message.reply_text("\n".join(["Armed (submit socket warmed):"] + list(res)))
 
 
 async def _fire_all(update, only_eligible=True):
@@ -723,17 +748,17 @@ async def _fire_all(update, only_eligible=True):
 @owner_only
 async def mintall_cmd(update, context):
     if not STATE["contract"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     res = await _fire_all(update, only_eligible=True)
-    await update.message.reply_text("\n".join(["Mint all:"] + [f"[{n}] {r}" for n, r in res]))
+    await update.effective_message.reply_text("\n".join(["Mint all:"] + [f"[{n}] {r}" for n, r in res]))
 
 
 async def _wallet_hunt(update, wal, interval, deadline=None):
     _w3 = w3(); _sw = submit_w3()
     while True:
         if deadline and time.time() > deadline:
-            await update.message.reply_text(f"[{wal['name']}] window closed - not eligible/open.")
+            await update.effective_message.reply_text(f"[{wal['name']}] window closed - not eligible/open.")
             return
         try:
             await run_blocking(sim_wallet, _w3, wal)  # no revert -> this wallet can mint now
@@ -747,22 +772,22 @@ async def _wallet_hunt(update, wal, interval, deadline=None):
                 raw = sign_wallet(_w3, wal, tx)
             txh = await run_blocking(do_send, _sw, raw)
             wal["armed"] = None
-            await update.message.reply_text(f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
+            await update.effective_message.reply_text(f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
         except Exception as e:
-            await update.message.reply_text(f"[{wal['name']}] fire failed: {str(e)[:120]}")
+            await update.effective_message.reply_text(f"[{wal['name']}] fire failed: {str(e)[:120]}")
         return
 
 
 @owner_only
 async def autoall_cmd(update, context):
     if not STATE["contract"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     if any(t and not t.done() for t in STATE["auto_tasks"].values()):
-        await update.message.reply_text("Auto already running. /cancel first.")
+        await update.effective_message.reply_text("Auto already running. /cancel first.")
         return
-    interval = 0.2
+    interval = 0.1
     if context.args:
         try:
             interval = max(0.05, float(context.args[0]) / 1000.0)
@@ -772,7 +797,7 @@ async def autoall_cmd(update, context):
         wal["name"]: asyncio.create_task(_wallet_hunt(update, wal, interval, None))
         for wal in STATE["wallets"]
     }
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Auto-mint watching {len(STATE['wallets'])} wallets. Each fires the instant IT is eligible. "
         f"Poll {int(interval*1000)}ms. (Use a dedicated RPC for many wallets.) /cancel to stop."
     )
@@ -799,7 +824,7 @@ async def _scheduled_all(update, target, lead, interval, window):
         await run_blocking(lambda: submit_w3().eth.block_number)
     except Exception:
         pass
-    await update.message.reply_text("Go-time. Re-armed all wallets. Watching per-wallet eligibility now...")
+    await update.effective_message.reply_text("Go-time. Re-armed all wallets. Watching per-wallet eligibility now...")
     STATE["auto_tasks"] = {}
     tasks = []
     for wal in STATE["wallets"]:
@@ -814,13 +839,13 @@ async def _scheduled_all(update, target, lead, interval, window):
 @owner_only
 async def scheduleall_cmd(update, context):
     if STATE["sched_task"] and not STATE["sched_task"].done():
-        await update.message.reply_text("Already scheduled. /cancel first.")
+        await update.effective_message.reply_text("Already scheduled. /cancel first.")
         return
     if not STATE["contract"]:
-        await update.message.reply_text("Run /source first.")
+        await update.effective_message.reply_text("Run /source first.")
         return
     if not context.args:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Usage: /scheduleall <when> [leadSeconds] [pollMs]\n"
             "when = +90m | 2026-07-20T14:00:00Z | 2026-07-20T20:00:00+06:00 | epoch\n"
             "e.g. /scheduleall 2026-07-20T14:00:00Z 3 150"
@@ -829,12 +854,12 @@ async def scheduleall_cmd(update, context):
     try:
         target = parse_when(context.args[0])
     except Exception as e:
-        await update.message.reply_text(f"time error: {e}")
+        await update.effective_message.reply_text(f"time error: {e}")
         return
     if target <= time.time():
-        await update.message.reply_text("That time is in the past.")
+        await update.effective_message.reply_text("That time is in the past.")
         return
-    lead, interval, window = 3.0, 0.15, 180.0
+    lead, interval, window = 3.0, 0.1, 180.0
     if len(context.args) >= 2:
         try:
             lead = max(0.0, float(context.args[1]))
@@ -848,7 +873,7 @@ async def scheduleall_cmd(update, context):
     STATE["sched_target"] = target
     STATE["sched_task"] = asyncio.create_task(_scheduled_all(update, target, lead, interval, window))
     utc = datetime.fromtimestamp(target, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Scheduled all {len(STATE['wallets'])} wallets.\n"
         f"Target: {utc}  (in {_fmt_eta(target)})\n"
         f"Re-arms {int(lead)}s early, then each wallet fires on its own eligibility.\n"
@@ -857,23 +882,58 @@ async def scheduleall_cmd(update, context):
 
 
 @owner_only
-async def cancel_cmd(update, context):
+def _stop_watch():
+    """Stop auto-mint + scheduled watching and clear armed txs. Returns a summary."""
+    n_auto = sum(1 for t in STATE["auto_tasks"].values() if t and not t.done())
     for t in STATE["auto_tasks"].values():
         if t and not t.done():
             t.cancel()
     STATE["auto_tasks"] = {}
-    if STATE["sched_task"] and not STATE["sched_task"].done():
+    had_sched = bool(STATE["sched_task"] and not STATE["sched_task"].done())
+    if had_sched:
         STATE["sched_task"].cancel()
     STATE["sched_task"] = None
     STATE["sched_target"] = None
     for wal in STATE["wallets"]:
         wal["armed"] = None
         wal["armed_nonce"] = None
-    if STATE.get("copy_task") and not STATE["copy_task"].done():
-        STATE["copy_task"].cancel()
-    STATE["copy_task"] = None
-    STATE["copy_target"] = None
-    await update.message.reply_text("Cancelled auto + schedule + copy + cleared armed txs.")
+    return n_auto, had_sched
+
+
+def _stop_copy():
+    n = 0
+    for t in STATE["copy_tasks"].values():
+        if t and not t.done():
+            t.cancel()
+            n += 1
+    STATE["copy_tasks"] = {}
+    return n
+
+
+@owner_only
+async def stopwatch_cmd(update, context):
+    n_auto, had_sched = _stop_watch()
+    bits = []
+    if n_auto:
+        bits.append(f"{n_auto} auto watcher(s)")
+    if had_sched:
+        bits.append("scheduled mint")
+    await update.effective_message.reply_text(
+        ("Stopped " + " + ".join(bits) + " + cleared armed txs.") if bits
+        else "Nothing was watching. Armed txs cleared."
+    )
+
+
+@owner_only
+async def stopcopy_cmd(update, context):
+    await update.effective_message.reply_text("Copy-mint stopped." if _stop_copy() else "Copy-mint wasn't running.")
+
+
+@owner_only
+async def cancel_cmd(update, context):
+    _stop_watch()
+    _stop_copy()
+    await update.effective_message.reply_text("Cancelled EVERYTHING (auto + schedule + copy) + cleared armed txs.")
 
 
 # ------------------------------------------------------------------ wallet mgmt
@@ -908,23 +968,23 @@ async def newwallet_cmd(update, context):
     lines = [f"Created {n} wallet(s). Total now {len(STATE['wallets'])}. Fund each with ETH on RH Chain:"]
     lines += [f"{base+i+1}. {addr}" for i, addr in enumerate(addrs)]
     lines.append("Keys saved to wallets.json on this server - BACK IT UP. Lose the file, lose the wallets.")
-    await update.message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 @owner_only
 async def importwallet_cmd(update, context):
     if not context.args:
-        await update.message.reply_text("Usage: /importwallet 0xPRIVATEKEY")
+        await update.effective_message.reply_text("Usage: /importwallet 0xPRIVATEKEY")
         return
     key = context.args[0].strip()
     try:
         a = Web3().eth.account.from_key(key)
     except Exception:
-        await update.message.reply_text("Invalid private key.")
+        await update.effective_message.reply_text("Invalid private key.")
         return
     append_wallets([{"name": f"w{len(STATE['wallets'])+1}", "key": key, "qty": 1}])
     STATE["wallets"] = load_wallets()
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Imported {a.address}. Total {len(STATE['wallets'])}.\n"
         "Now DELETE your /importwallet message - it contains the key and Telegram keeps history."
     )
@@ -933,7 +993,7 @@ async def importwallet_cmd(update, context):
 @owner_only
 async def setgas_cmd(update, context):
     if not context.args:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Usage: /setgas <maxFeeGwei> [priorityGwei] [gasLimit]\n"
             "e.g. /setgas 0.1 0.01 500000   |   /setgas auto to reset"
         )
@@ -942,7 +1002,7 @@ async def setgas_cmd(update, context):
         STATE["gas_max_fee"] = STATE["gas_priority"] = STATE["gas_limit_override"] = None
         for w in STATE["wallets"]:
             w["armed"] = None
-        await update.message.reply_text("Gas back to auto.")
+        await update.effective_message.reply_text("Gas back to auto.")
         return
     try:
         STATE["gas_max_fee"] = int(Web3.to_wei(Decimal(context.args[0]), "gwei"))
@@ -951,11 +1011,11 @@ async def setgas_cmd(update, context):
         if len(context.args) >= 3:
             STATE["gas_limit_override"] = int(context.args[2])
     except Exception:
-        await update.message.reply_text("bad values")
+        await update.effective_message.reply_text("bad values")
         return
     for w in STATE["wallets"]:
         w["armed"] = None
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Gas set: maxFee {context.args[0]} gwei. "
         "(Heads up: on this FCFS chain higher gas doesn't win the race - lowest latency does - "
         "but it's set as you asked.)"
@@ -1109,23 +1169,82 @@ async def cb_handler(update, context):
         except Exception:
             pass
         await copy_fire(context, q.message.chat_id, pend["to"], pend["data"], pend["value"])
+        return
+    if len(parts) == 2 and parts[0] == "act":
+        a = parts[1]
+        if a == "sim":
+            await simall_cmd(update, context)
+        elif a == "arm":
+            await armall_cmd(update, context)
+        elif a == "mint":
+            await mintall_cmd(update, context)
+        elif a == "auto":
+            await autoall_cmd(update, context)
+        return
+    if parts[0] == "cw":
+        if len(parts) == 2 and parts[1] == "add":
+            STATE["awaiting_copy"] = True
+            await context.bot.send_message(
+                q.message.chat_id,
+                "Send the wallet address to copy-mint (paste the 0x address). /cancel to abort.")
+            return
+        if len(parts) == 3 and parts[1] == "rm":
+            addr = parts[2]
+            t = STATE["copy_tasks"].pop(addr, None)
+            if t and not t.done():
+                t.cancel()
+            try:
+                await q.edit_message_text(copywatch_text(), reply_markup=copywatch_kb())
+            except Exception:
+                pass
+            return
+
+
+async def add_copy_target(context, chat_id, target, interval=3.0):
+    existing = STATE["copy_tasks"].get(target)
+    if existing and not existing.done():
+        await context.bot.send_message(chat_id, f"Already tracking {target[:10]}..")
+        return
+    STATE["copy_tasks"][target] = asyncio.create_task(_copy_loop(context, chat_id, target, interval))
+    await context.bot.send_message(
+        chat_id,
+        f"Added to copy watchlist: {target}\nNow tracking {len(STATE['copy_tasks'])} wallet(s). /copywatch to manage.")
+
+
+def copywatch_text():
+    active = {a: t for a, t in STATE["copy_tasks"].items() if t and not t.done()}
+    if not active:
+        return "Copy-mint watchlist: empty.\nTap + Add below, or send /copy 0xADDRESS."
+    lines = [f"Copy-mint watchlist ({len(active)}):"]
+    for a in active:
+        lines.append(" - " + a)
+    return "\n".join(lines)
+
+
+def copywatch_kb():
+    rows = []
+    for a, t in STATE["copy_tasks"].items():
+        if t and not t.done():
+            rows.append([InlineKeyboardButton(f"Remove {a[:8]}..{a[-4:]}", callback_data=f"cw|rm|{a}")])
+    rows.append([InlineKeyboardButton("+ Add wallet", callback_data="cw|add")])
+    return InlineKeyboardMarkup(rows)
+
+
+@owner_only
+async def copywatch_cmd(update, context):
+    await update.effective_message.reply_text(copywatch_text(), reply_markup=copywatch_kb())
 
 
 @owner_only
 async def copy_cmd(update, context):
-    if STATE.get("copy_task") and not STATE["copy_task"].done():
-        await update.message.reply_text("Already copying. /cancel first.")
-        return
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /copy 0xTARGET_ADDRESS [pollSeconds]\n"
-            "Watches that wallet; when it mints, your wallets mint the same contract."
-        )
+        await update.effective_message.reply_text(
+            "Usage: /copy 0xTARGET_ADDRESS [pollSeconds] - adds a wallet to the copy watchlist.")
         return
     try:
         target = Web3.to_checksum_address(context.args[0])
     except Exception:
-        await update.message.reply_text("Invalid address.")
+        await update.effective_message.reply_text("Invalid address.")
         return
     interval = 3.0
     if len(context.args) >= 2:
@@ -1133,8 +1252,7 @@ async def copy_cmd(update, context):
             interval = max(1.0, float(context.args[1]))
         except ValueError:
             pass
-    STATE["copy_target"] = target
-    STATE["copy_task"] = asyncio.create_task(_copy_loop(context, update.effective_chat.id, target, interval))
+    await add_copy_target(context, update.effective_chat.id, target, interval)
 
 
 async def guard_msg(update, context):
@@ -1142,14 +1260,24 @@ async def guard_msg(update, context):
         return
     if OWNER_ID and update.effective_user and update.effective_user.id != OWNER_ID:
         return
-    if PK_PATTERN.search(update.message.text):
+    text = update.message.text.strip()
+    if PK_PATTERN.search(text):
         await update.message.reply_text(
-            "WARNING: that looks like a private key. DELETE that message now.\n"
-            "Keys go in wallets.json on your server, never in chat - a key pasted into Telegram is "
-            "stored on Telegram's servers and must be treated as compromised."
-        )
+            "WARNING: that looks like a private key. DELETE that message now. "
+            "Keys go in wallets.json on your server, never in chat.")
         return
-    await update.message.reply_text("Unknown input. /help for commands.")
+    if STATE.get("awaiting_copy"):
+        m = re.search(r"0x[a-fA-F0-9]{40}", text)
+        if not m:
+            await update.message.reply_text("Not a valid address. Paste a 0x wallet address, or /cancel.")
+            return
+        STATE["awaiting_copy"] = False
+        await add_copy_target(context, update.effective_chat.id, Web3.to_checksum_address(m.group(0)))
+        return
+    if re.search(r"0x[a-fA-F0-9]{40}", text) or "opensea.io" in text:
+        await do_source(update, context, text)
+        return
+    await update.message.reply_text("Paste a contract address or OpenSea link to load it, or /help.")
 
 
 # ------------------------------------------------------------------ main
@@ -1172,6 +1300,8 @@ def main():
         ("scheduleall", scheduleall_cmd), ("cancel", cancel_cmd),
         ("newwallet", newwallet_cmd), ("importwallet", importwallet_cmd),
         ("setgas", setgas_cmd), ("copy", copy_cmd),
+        ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
+        ("copywatch", copywatch_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

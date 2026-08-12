@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from web3 import Web3
+from eth_abi import encode as abi_encode
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters,
@@ -57,17 +58,35 @@ OPENSEA_KEY    = os.environ.get("OPENSEA_API_KEY", "").strip()  # optional, for 
 
 PK_PATTERN = re.compile(r"\b(0x)?[0-9a-fA-F]{64}\b")
 
-# known mint function selectors (for copy-mint detection)
-MINT_SIGS = [
+# simple (auto-buildable) vs proof (needs per-wallet calldata) mint signatures
+SIMPLE_SIGS = [
     "mint(uint256)", "mint()", "mint(address,uint256)", "mint(uint256,address)",
     "publicMint(uint256)", "publicMint()", "mintPublic(uint256)", "mintPublic()",
     "mintTo(address,uint256)", "claim(uint256)", "claim()", "freeMint(uint256)",
-    "freeMint()", "mint(address)", "mint(uint256,bytes32[])",
-    "mintAllowList(uint256,bytes32[])", "whitelistMint(uint256,bytes32[])",
-    "allowlistMint(uint256,bytes32[])", "mint(bytes32,bytes)", "mint(uint256,bytes)",
-    "claim(uint256,bytes32[])",
+    "freeMint()", "mint(address)",
 ]
+PROOF_SIGS = [
+    "mint(uint256,bytes32[])", "mint(bytes32[],uint256)", "mint(bytes32,bytes)",
+    "mint(uint256,bytes)", "mintAllowList(uint256,bytes32[])",
+    "whitelistMint(uint256,bytes32[])", "allowlistMint(uint256,bytes32[])",
+    "mintWhitelist(uint256,bytes32[])", "claim(uint256,bytes32[])",
+]
+MINT_SIGS = SIMPLE_SIGS + PROOF_SIGS
 MINT_SELECTORS = {"0x" + Web3.keccak(text=s)[:4].hex().replace("0x", "").lower() for s in MINT_SIGS}
+
+
+def selector(sig):
+    return Web3.keccak(text=sig)[:4].hex().replace("0x", "").lower()
+
+
+def sig_types(sig):
+    inner = sig[sig.index("(") + 1:sig.rindex(")")]
+    return [t for t in inner.split(",") if t]
+
+
+def get_code(_w3, addr):
+    h = _w3.eth.get_code(addr).hex()
+    return h if h.startswith("0x") else "0x" + h
 
 # ------------------------------------------------------------------ state
 STATE = {
@@ -161,20 +180,18 @@ def wallet_calldata(_w3, wal):
         raise ValueError("no mint function set - run /source, or add per-wallet calldata")
     inputs = STATE["fn_inputs"] or []
     qty = wal["qty"] or STATE["qty"]
-    if len(inputs) == 0:
-        args = []
-    elif len(inputs) == 1 and inputs[0].startswith("uint"):
-        args = [qty]
-    elif len(inputs) == 2 and inputs[0] == "address" and inputs[1].startswith("uint"):
-        args = [wal["address"], qty]
-    else:
-        raise ValueError(f"can't auto-build {STATE['fn']}({','.join(inputs)}) - needs per-wallet calldata")
-    c = _w3.eth.contract(address=STATE["contract"], abi=STATE["abi"])
-    try:
-        data = c.functions[STATE["fn"]](*args)._encode_transaction_data()
-    except Exception:
-        data = c.encode_abi(abi_element_identifier=STATE["fn"], args=args)
-    return data if data.startswith("0x") else "0x" + data
+    args = []
+    for t in inputs:
+        if t.startswith("uint"):
+            args.append(int(qty))
+        elif t == "address":
+            args.append(Web3.to_checksum_address(wal["address"]))
+        else:
+            raise ValueError(f"can't auto-build {STATE['fn']}({','.join(inputs)}) - needs per-wallet calldata")
+    sig = f"{STATE['fn']}({','.join(inputs)})"
+    sel = selector(sig)
+    enc = abi_encode(inputs, args).hex() if inputs else ""
+    return "0x" + sel + enc
 
 
 def build_wallet_tx(_w3, wal, nonce=None):
@@ -422,8 +439,32 @@ async def source_cmd(update, context):
     except Exception:
         abi = None
     if not abi:
-        msg.append("ABI not verified on Blockscout - I can't auto-build calldata. Each wallet will "
-                   "need its own 'calldata' in wallets.json (from the project's mint page).")
+        try:
+            code = await run_blocking(get_code, _w3, addr)
+        except Exception:
+            code = "0x"
+        hexcode = code[2:].lower() if code else ""
+        if not hexcode:
+            msg.append("No contract code at that address - double-check it's the mint contract.")
+            await update.message.reply_text("\n".join(msg))
+            return
+        found_simple = [s for s in SIMPLE_SIGS if ("63" + selector(s)) in hexcode]
+        found_proof = [s for s in PROOF_SIGS if ("63" + selector(s)) in hexcode]
+        if found_simple:
+            sig = found_simple[0]
+            STATE["fn"], STATE["fn_inputs"] = sig.split("(")[0], sig_types(sig)
+            msg.append(f"Unverified, but I read the bytecode: found {sig} - SIMPLE mint. "
+                       "I'll build calldata for all wallets automatically.")
+            if found_proof:
+                msg.append("(bytecode also has: " + ", ".join(found_proof) + ")")
+            msg.append("Next: /setqty if needed -> /simall -> /armall -> /autoall.")
+        elif found_proof:
+            msg.append(f"Unverified; bytecode shows {found_proof[0]} - a PROOF/signature whitelist. "
+                       "That proof is issued by the project per wallet; no bot can invent it. "
+                       "Put each wallet's calldata in wallets.json.")
+        else:
+            msg.append("Unverified and no known mint selector in the bytecode. Capture the calldata "
+                       "from a real mint tx (MetaMask Hex view, or a mint tx on Blockscout) -> wallets.json.")
         await update.message.reply_text("\n".join(msg))
         return
     STATE["abi"] = abi

@@ -1,126 +1,65 @@
-# rh-mint-bot — Robinhood Chain multi-wallet mint bot (Telegram-controlled)
+# rh-sniper — smart terminal FCFS mint sniper for Robinhood Chain
 
-Self-hosted. Your keys live in `wallets.json` on your own server and never leave
-it. Telegram is your remote control. Chain id 4663, gas token ETH.
+Telegram-free. You give it a contract; it figures out the mint call itself and
+fires all your wallets the instant the sale opens.
 
-Includes a bonus `terminal-sniper/` — a Telegram-free CLI version for the
-absolute fastest fire (see its own README).
+## How the auto-detect works
+1. **Verified contract** → reads the ABI, finds the mint function and price.
+2. **Unverified contract** → reads the raw bytecode and matches function
+   **selectors locally** (no external database, nothing to rate-limit), recovering
+   common mints like `mint(uint256)`, `publicMint(uint256)`, `claim(uint256)`.
+3. **Simple / public mint** → builds calldata for every wallet automatically.
+4. **Proof / signature mint** (Merkle proof or backend signature) → detected and
+   named plainly. These need each wallet's own `calldata` from the project — no
+   tool can invent that value, because it isn't on-chain. This is the honest wall
+   every mint bot hits; the difference here is it tells you instead of erroring.
 
----
+You can always set exact `calldata` in config (global or per-wallet); that wins
+over auto-detect and is the most reliable path for anything unusual.
 
-## What it does
-- Unlimited wallets: `/newwallet`, `/importwallet`
-- Mint by contract (auto-detects the mint call): `/source`, `/simall`, `/armall`, `/autoall`
-- Scheduled mint at WL start: `/scheduleall`
-- Copy-mint another wallet: `/copy`
-- Gas override: `/setgas`
-
-Not included: listing/sniping on OpenSea — that needs an OpenSea API key (gated,
-from OpenSea's developer platform). Add the key and it can be wired in.
-
----
-
-## 1) Put it on GitHub
-Easiest from a computer browser:
-1. Create a **private** repo on github.com (e.g. `rh-mint-bot`).
-2. **Extract this zip** and upload the files (drag them into the repo's "Add file
-   → Upload files"). Upload the *files*, not the zip.
-3. Commit.
-
-`.gitignore` already excludes `.env` and `wallets.json`, so your secrets never
-get uploaded — but only if you never create those files before pushing. Keep the
-repo private regardless.
-
-## 2) Clone + set up on your VPS
-SSH into the VPS, then:
+## Commands
 ```bash
-sudo apt update && sudo apt install -y python3-venv python3-pip git tmux
-git clone https://github.com/YOUR_USERNAME/rh-mint-bot.git
-cd rh-mint-bot
+python snipe.py --detect     # inspect a contract: prints the mint fn + what to do (no keys needed)
+python snipe.py --check      # simulate each wallet once (eligibility), no fire
+python snipe.py              # watch, fire all wallets the instant it's live
+python snipe.py --now        # fire immediately (sale already open)
+```
+Overrides: `--contract 0x..|opensea-item-link`, `--calldata 0x..`, `--config other.json`.
+
+## config.json fields
+- `rpc_url` — Alchemy/QuickNode endpoint (reads + polling)
+- `submit_rpc_url` — optional; endpoint the fire tx is sent through (defaults to rpc_url)
+- `contract` — address or an OpenSea **item** link (collection links need the address)
+- `calldata` — leave **blank** to auto-detect; set it to force an exact call
+- `qty` — quantity per wallet (default 1); auto-detect fills mint args with this
+- `value_eth` — price per mint; blank/`"0"` uses the on-chain price if found
+- `poll_ms` — how often it checks for open (200 = 0.2s; lower is faster, needs a dedicated RPC)
+- `gas_limit` — fallback gas used to pre-sign before open
+- `start_time`, `lead_seconds`, `window_seconds` — optional scheduling
+- `wallets` — each `{ "name", "key" }`, plus optional per-wallet `calldata`, `qty`, `value_eth`
+
+## Efficiency
+- When every wallet shares the same call (simple mint), it watches **one** gate and
+  fires all wallets together — far less RPC load than polling each separately.
+- Everything is pre-signed; it fires raw with a warmed connection and a send retry.
+- On Robinhood Chain the earliest tx to the sequencer wins (not gas), so run it on a
+  small VPS near the sequencer for real speed. Use a dedicated RPC so fast polling
+  isn't rate-limited.
+
+## Setup
+```bash
+git clone <your-repo> rh-sniper && cd rh-sniper
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+cp config.example.json config.json
+nano config.json     # rpc, contract, your keys (config.json is git-ignored)
+python snipe.py --detect     # sanity-check before mint day
 ```
 
-## 3) Connect your Telegram bot
-The "connection" is just your bot token in `.env`. The script logs into Telegram
-with it and answers your commands.
-
-1. In Telegram, message **@BotFather** → `/newbot` (or `/mybots` → your existing
-   bot → API Token) → copy the token.
-2. Message **@userinfobot** → copy your numeric id.
-3. Create your config:
-```bash
-cp .env.example .env
-nano .env
-```
-Fill in:
-```
-TELEGRAM_BOT_TOKEN=your_bot_token
-AUTHORIZED_USER_ID=your_numeric_id
-RH_RPC_URL=https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY
-```
-Only that numeric id can command the bot.
-
-4. Add your wallets:
-```bash
-cp wallets.json.example wallets.json
-nano wallets.json     # paste your keys, or leave and use /newwallet later
-```
-
-## 4) Run it (stays up after you disconnect)
-```bash
-tmux new -s bot
-source venv/bin/activate
-python rh_mint_bot.py
-```
-When it prints `Bot up...`, detach with **Ctrl+B** then **D** — it keeps running.
-Reattach anytime: `tmux attach -t bot`. Stop: attach, then **Ctrl+C**.
-
-In Telegram, send `/start`, then `/wallets` to confirm it's connected.
-
-### Optional: auto-restart on reboot (systemd)
-```bash
-sudo tee /etc/systemd/system/rhbot.service > /dev/null << UNIT
-[Unit]
-Description=RH mint bot
-After=network.target
-[Service]
-WorkingDirectory=$HOME/rh-mint-bot
-ExecStart=$HOME/rh-mint-bot/venv/bin/python $HOME/rh-mint-bot/rh_mint_bot.py
-Restart=always
-[Install]
-WantedBy=multi-user.target
-UNIT
-sudo systemctl enable --now rhbot
-```
-Logs: `journalctl -u rhbot -f`
-
----
-
-## Command reference
-| Command | Does |
-|---|---|
-| `/wallets` | List wallets + balances |
-| `/newwallet [n]` | Create n new wallets |
-| `/importwallet 0xKEY` | Add an existing wallet |
-| `/source <link\|0x>` | Load contract, auto-detect mint fn + price |
-| `/setqty <n>` / `/setvalue 0.05` | Quantity / price per mint |
-| `/setgas <maxGwei> [prio] [limit]` | Gas override (`auto` resets) |
-| `/simall` | Simulate every wallet (eligibility, no gas) |
-| `/armall` | Pre-sign every wallet |
-| `/mintall` | Fire every eligible wallet now |
-| `/autoall [ms]` | Each wallet fires when it becomes eligible |
-| `/scheduleall <when>` | Auto-mint all at a set time |
-| `/copy 0xADDR [sec]` | Copy-mint a target wallet's mints |
-| `/status` | Full config |
-| `/cancel` | Stop everything |
-
-`<when>`: `2026-07-20T14:00:00Z`, `+90m`, or an offset like `+06:00`.
-
-## Honest notes
-- On this FCFS chain, **latency wins, not gas** — run the VPS near the sequencer.
-- Copy-mint **follows** (no mempool, so you can't front-run) and only works for
-  simple mints.
-- Proof/signature whitelist mints need each wallet's own `calldata` — no bot can
-  invent it.
-- Back up `wallets.json`. Lose it, lose the wallets.
+## Honest limits
+- It can only fire a call you can already make. Proof/signature mints need per-wallet
+  calldata from the project.
+- Anti-bot mints (1 IP = 1 mint, etc.) block multi-wallet minting regardless of speed;
+  some projects void sybil wallets.
+- Always confirm the correct contract from the official source — fake OpenSea
+  collections are common.

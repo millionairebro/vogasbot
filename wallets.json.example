@@ -1,0 +1,9 @@
+[
+  { "name": "w1", "key": "0xPRIVATE_KEY_1", "qty": 1 },
+  { "name": "w2", "key": "0xPRIVATE_KEY_2", "qty": 1 },
+  { "name": "w3", "key": "0xPRIVATE_KEY_3", "qty": 1 },
+  { "name": "w4", "key": "0xPRIVATE_KEY_4", "qty": 1 },
+  { "name": "w5", "key": "0xPRIVATE_KEY_5", "qty": 1 },
+  { "name": "w6", "key": "0xPRIVATE_KEY_6", "qty": 1 },
+  { "name": "w7", "key": "0xPRIVATE_KEY_7", "qty": 1 }
+]

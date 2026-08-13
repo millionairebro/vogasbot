@@ -459,8 +459,10 @@ async def help_cmd(update, context):
         "/importwallet 0xKEY - add an existing wallet\n"
         "/setgas <maxFeeGwei> [prioGwei] [gasLimit] - gas override (auto resets)\n"
         "/copy 0xADDR [sec] - copy-mint a target wallets mints\n"
-        "/stopwatch - stop auto/scheduled mint only\n"
-        "/stopcopy - stop copy-mint only\n"
+        "/cancelauto - stop auto-mint only\n"
+        "/cancelschedule - stop scheduled mint only\n"
+        "/cancelcopy - stop copy-mint only\n"
+        "/cancel - stop EVERYTHING\n"
         "/copywatch - view/manage copy watchlist (buttons)\n"
         "/rpcstatus - check the RPC pool endpoints\n"
         "(tip: just paste a contract/OS link - no /source needed)"
@@ -905,23 +907,25 @@ async def scheduleall_cmd(update, context):
     )
 
 
-@owner_only
-def _stop_watch():
-    """Stop auto-mint + scheduled watching and clear armed txs. Returns a summary."""
-    n_auto = sum(1 for t in STATE["auto_tasks"].values() if t and not t.done())
+def _stop_auto():
+    n = sum(1 for t in STATE["auto_tasks"].values() if t and not t.done())
     for t in STATE["auto_tasks"].values():
         if t and not t.done():
             t.cancel()
     STATE["auto_tasks"] = {}
-    had_sched = bool(STATE["sched_task"] and not STATE["sched_task"].done())
-    if had_sched:
-        STATE["sched_task"].cancel()
-    STATE["sched_task"] = None
-    STATE["sched_target"] = None
     for wal in STATE["wallets"]:
         wal["armed"] = None
         wal["armed_nonce"] = None
-    return n_auto, had_sched
+    return n
+
+
+def _stop_schedule():
+    had = bool(STATE["sched_task"] and not STATE["sched_task"].done())
+    if had:
+        STATE["sched_task"].cancel()
+    STATE["sched_task"] = None
+    STATE["sched_target"] = None
+    return had
 
 
 def _stop_copy():
@@ -934,18 +938,42 @@ def _stop_copy():
     return n
 
 
+# backward-compat wrapper (used by /stopwatch)
+def _stop_watch():
+    return _stop_auto(), _stop_schedule()
+
+
+@owner_only
+async def cancelauto_cmd(update, context):
+    n = _stop_auto()
+    await update.effective_message.reply_text(
+        f"Auto-mint stopped ({n} watcher(s)). Armed txs cleared." if n else "Auto-mint wasn't running.")
+
+
+@owner_only
+async def cancelschedule_cmd(update, context):
+    await update.effective_message.reply_text(
+        "Scheduled mint stopped." if _stop_schedule() else "No scheduled mint was set.")
+
+
+@owner_only
+async def cancelcopy_cmd(update, context):
+    await update.effective_message.reply_text(
+        "Copy-mint stopped." if _stop_copy() else "Copy-mint wasn't running.")
+
+
+# aliases kept so old names still work
 @owner_only
 async def stopwatch_cmd(update, context):
-    n_auto, had_sched = _stop_watch()
+    n = _stop_auto()
+    had = _stop_schedule()
     bits = []
-    if n_auto:
-        bits.append(f"{n_auto} auto watcher(s)")
-    if had_sched:
+    if n:
+        bits.append(f"{n} auto watcher(s)")
+    if had:
         bits.append("scheduled mint")
     await update.effective_message.reply_text(
-        ("Stopped " + " + ".join(bits) + " + cleared armed txs.") if bits
-        else "Nothing was watching. Armed txs cleared."
-    )
+        ("Stopped " + " + ".join(bits) + " + cleared armed txs.") if bits else "Nothing was watching.")
 
 
 @owner_only
@@ -955,9 +983,11 @@ async def stopcopy_cmd(update, context):
 
 @owner_only
 async def cancel_cmd(update, context):
-    _stop_watch()
-    _stop_copy()
-    await update.effective_message.reply_text("Cancelled EVERYTHING (auto + schedule + copy) + cleared armed txs.")
+    a = _stop_auto()
+    s = _stop_schedule()
+    c = _stop_copy()
+    await update.effective_message.reply_text(
+        f"Cancelled EVERYTHING - auto ({a}), schedule ({'yes' if s else 'no'}), copy ({c}). Armed txs cleared.")
 
 
 # ------------------------------------------------------------------ wallet mgmt
@@ -1345,6 +1375,8 @@ def main():
         ("setgas", setgas_cmd), ("copy", copy_cmd),
         ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
+        ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
+        ("cancelcopy", cancelcopy_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

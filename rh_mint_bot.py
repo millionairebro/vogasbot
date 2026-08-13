@@ -51,6 +51,8 @@ PRIVATE_KEY    = os.environ.get("RH_PRIVATE_KEY", "").strip()  # fallback if no 
 WALLETS_FILE   = os.environ.get("RH_WALLETS_FILE", "wallets.json").strip()
 RPC_URL        = os.environ.get("RH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com").strip()
 SUBMIT_RPC_URL = (os.environ.get("RH_SUBMIT_RPC_URL", "").strip() or RPC_URL)
+_pool_raw = os.environ.get("RH_RPC_POOL", "").strip()
+RPC_POOL = [u.strip() for u in re.split(r"[,\s]+", _pool_raw) if u.strip()] or [RPC_URL]
 CHAIN_ID       = int(os.environ.get("RH_CHAIN_ID", "4663") or "4663")
 BLOCKSCOUT     = os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api").strip()
 EXPLORER       = os.environ.get("RH_EXPLORER", "https://robinhoodchain.blockscout.com").rstrip("/")
@@ -159,6 +161,20 @@ def submit_w3():
     return _SUBMIT
 
 
+_POOL_W3 = {}
+
+
+def pool_w3(i):
+    url = RPC_POOL[i % len(RPC_POOL)]
+    if url not in _POOL_W3:
+        _POOL_W3[url] = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+    return _POOL_W3[url]
+
+
+def wallet_w3(wal):
+    return pool_w3(wal.get("rpc_idx", 0))
+
+
 async def run_blocking(fn, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn, *args)
@@ -183,11 +199,12 @@ def load_wallets():
     elif PRIVATE_KEY:
         out.append({"name": "w1", "key": PRIVATE_KEY, "qty": 1, "value_wei": 0, "calldata": ""})
     acct_factory = Web3().eth.account
-    for w in out:
+    for i, w in enumerate(out):
         w["account"] = acct_factory.from_key(w["key"])  # raises on a bad key
         w["address"] = w["account"].address
         w["armed"] = None
         w["armed_nonce"] = None
+        w["rpc_idx"] = i
     return out
 
 
@@ -445,6 +462,7 @@ async def help_cmd(update, context):
         "/stopwatch - stop auto/scheduled mint only\n"
         "/stopcopy - stop copy-mint only\n"
         "/copywatch - view/manage copy watchlist (buttons)\n"
+        "/rpcstatus - check the RPC pool endpoints\n"
         "(tip: just paste a contract/OS link - no /source needed)"
     )
 
@@ -686,6 +704,7 @@ async def simall_cmd(update, context):
     _w3 = w3()
 
     async def one(wal):
+        _w3 = wallet_w3(wal)
         try:
             await run_blocking(sim_wallet, _w3, wal)
             return f"[{wal['name']}] ELIGIBLE - would mint now"
@@ -704,6 +723,7 @@ async def armall_cmd(update, context):
     _w3 = w3()
 
     async def one(wal):
+        _w3 = wallet_w3(wal)
         try:
             tx = await run_blocking(build_wallet_tx, _w3, wal, None)
             wal["armed"] = sign_wallet(_w3, wal, tx)
@@ -725,6 +745,8 @@ async def _fire_all(update, only_eligible=True):
     _w3 = w3(); _sw = submit_w3()
 
     async def one(wal):
+        _w3 = wallet_w3(wal)
+        _sw = _w3
         try:
             if only_eligible:
                 try:
@@ -755,7 +777,8 @@ async def mintall_cmd(update, context):
 
 
 async def _wallet_hunt(update, wal, interval, deadline=None):
-    _w3 = w3(); _sw = submit_w3()
+    _w3 = wallet_w3(wal)
+    _sw = _w3
     while True:
         if deadline and time.time() > deadline:
             await update.effective_message.reply_text(f"[{wal['name']}] window closed - not eligible/open.")
@@ -812,6 +835,7 @@ async def _scheduled_all(update, target, lead, interval, window):
     _w3 = w3()
 
     async def arm(wal):
+        _w3 = wallet_w3(wal)
         try:
             tx = await run_blocking(build_wallet_tx, _w3, wal, None)
             wal["armed"] = sign_wallet(_w3, wal, tx)
@@ -1255,6 +1279,25 @@ async def copy_cmd(update, context):
     await add_copy_target(context, update.effective_chat.id, target, interval)
 
 
+@owner_only
+async def rpcstatus_cmd(update, context):
+    n = len(RPC_POOL)
+    lines = [f"RPC pool: {n} endpoint(s) | {len(STATE['wallets'])} wallets spread across them"]
+
+    async def chk(i):
+        url = RPC_POOL[i]
+        host = url.split("/")[2] if "//" in url else url
+        wc = sum(1 for w in STATE["wallets"] if w.get("rpc_idx", 0) % n == i)
+        try:
+            bn = await run_blocking(lambda: pool_w3(i).eth.block_number)
+            return f"[{i+1}] OK block {bn} | {wc} wallet(s) | {host}"
+        except Exception as e:
+            return f"[{i+1}] DOWN {str(e)[:30]} | {wc} wallet(s) | {host}"
+
+    res = await asyncio.gather(*[chk(i) for i in range(n)])
+    await update.effective_message.reply_text("\n".join(lines + list(res)))
+
+
 async def guard_msg(update, context):
     if not update.message or not update.message.text:
         return
@@ -1301,7 +1344,7 @@ def main():
         ("newwallet", newwallet_cmd), ("importwallet", importwallet_cmd),
         ("setgas", setgas_cmd), ("copy", copy_cmd),
         ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
-        ("copywatch", copywatch_cmd),
+        ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

@@ -76,6 +76,13 @@ PROOF_SIGS = [
 ]
 MINT_SIGS = SIMPLE_SIGS + PROOF_SIGS
 MINT_SELECTORS = {"0x" + Web3.keccak(text=s)[:4].hex().replace("0x", "").lower() for s in MINT_SIGS}
+# SeaDrop routes mints through its own contract - include those so copy-mint sees OpenSea mints
+SEADROP_SIGS = [
+    "mintPublic(address,address,address,uint256)",
+    "mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)",
+    "mintAllowList(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),bytes32[])",
+]
+MINT_SELECTORS |= {"0x" + Web3.keccak(text=s)[:4].hex().replace("0x", "").lower() for s in SEADROP_SIGS}
 
 
 def selector(sig):

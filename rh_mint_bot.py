@@ -168,6 +168,7 @@ STATE = {
     "gas_priority": None,
     "gas_limit_override": None,
     "copy_tasks":   {},
+    "copy_labels":  {},
     "awaiting_copy": False,
     "seadrop":      False,
     "seadrop_collection": None,
@@ -568,6 +569,9 @@ async def help_cmd(update, context):
         "/cancelschedule - stop scheduled mint only\n"
         "/cancelcopy - stop copy-mint only\n"
         "/cancel - stop EVERYTHING\n"
+        "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
+        "/copy 0xADDR [name] - track a wallet (named alerts)\n"
+        "/rename 0xADDR <name> - rename a tracked wallet\n"
         "/copywatch - view/manage copy watchlist (buttons)\n"
         "/rpcstatus - check the RPC pool endpoints\n"
         "(tip: just paste a contract/OS link - no /source needed)"
@@ -1323,7 +1327,8 @@ async def _copy_loop(context, chat_id, target, interval):
             to = Web3.to_checksum_address(to)
             val = int(t.get("value") or "0")
             if val == 0:
-                await context.bot.send_message(chat_id, f"Copy: target FREE-minted {to[:10]}.. -> firing all wallets")
+                await context.bot.send_message(
+                    chat_id, f"Copy: {copy_label(target)} FREE-minted {to[:10]}.. -> firing all wallets")
                 asyncio.create_task(copy_fire(context, chat_id, to, data, val))
             else:
                 pid = str(STATE["pending_seq"])
@@ -1336,8 +1341,11 @@ async def _copy_loop(context, chat_id, target, interval):
                 ]])
                 await context.bot.send_message(
                     chat_id,
-                    f"Copy: target minted a PAID drop ({price} ETH) at {to[:10]}..\n"
-                    f"Mint from your {len(STATE['wallets'])} wallets?",
+                    f"Copy: {copy_label(target)} minted a PAID drop\n"
+                    f"Price {price} ETH x {len(STATE['wallets'])} wallets "
+                    f"= {price * len(STATE['wallets'])} ETH total\n"
+                    f"Contract {to}\n"
+                    f"Mint from your wallets?",
                     reply_markup=kb,
                 )
         await asyncio.sleep(interval)
@@ -1402,15 +1410,24 @@ async def cb_handler(update, context):
             return
 
 
-async def add_copy_target(context, chat_id, target, interval=1.0):
+def copy_label(addr):
+    """Friendly name for a tracked wallet, falling back to a short address."""
+    lbl = STATE["copy_labels"].get(addr)
+    return lbl if lbl else f"{addr[:8]}..{addr[-4:]}"
+
+
+async def add_copy_target(context, chat_id, target, interval=1.0, label=None):
     existing = STATE["copy_tasks"].get(target)
     if existing and not existing.done():
         await context.bot.send_message(chat_id, f"Already tracking {target[:10]}..")
         return
+    if label:
+        STATE["copy_labels"][target] = label
     STATE["copy_tasks"][target] = asyncio.create_task(_copy_loop(context, chat_id, target, interval))
     await context.bot.send_message(
         chat_id,
-        f"Added to copy watchlist: {target}\nNow tracking {len(STATE['copy_tasks'])} wallet(s). /copywatch to manage.")
+        f"Added to copy watchlist: {copy_label(target)}\n{target}\n"
+        f"Now tracking {len(STATE['copy_tasks'])} wallet(s). /copywatch to manage.")
 
 
 def copywatch_text():
@@ -1419,7 +1436,8 @@ def copywatch_text():
         return "Copy-mint watchlist: empty.\nTap + Add below, or send /copy 0xADDRESS."
     lines = [f"Copy-mint watchlist ({len(active)}):"]
     for a in active:
-        lines.append(" - " + a)
+        lbl = STATE["copy_labels"].get(a)
+        lines.append(f" - {lbl}\n   {a}" if lbl else f" - {a}")
     return "\n".join(lines)
 
 
@@ -1427,7 +1445,7 @@ def copywatch_kb():
     rows = []
     for a, t in STATE["copy_tasks"].items():
         if t and not t.done():
-            rows.append([InlineKeyboardButton(f"Remove {a[:8]}..{a[-4:]}", callback_data=f"cw|rm|{a}")])
+            rows.append([InlineKeyboardButton(f"Remove {copy_label(a)}", callback_data=f"cw|rm|{a}")])
     rows.append([InlineKeyboardButton("+ Add wallet", callback_data="cw|add")])
     return InlineKeyboardMarkup(rows)
 
@@ -1441,20 +1459,103 @@ async def copywatch_cmd(update, context):
 async def copy_cmd(update, context):
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: /copy 0xTARGET_ADDRESS [pollSeconds] - adds a wallet to the copy watchlist.")
+            "Usage: /copy 0xADDRESS [name]\n"
+            "e.g. /copy 0xabc... whale1\n"
+            "The name shows in alerts so you know whose mint it is. /rename to change it.")
         return
     try:
         target = Web3.to_checksum_address(context.args[0])
     except Exception:
         await update.effective_message.reply_text("Invalid address.")
         return
-    interval = 1.0
+    label = " ".join(context.args[1:]).strip() or None
+    await add_copy_target(context, update.effective_chat.id, target, 1.0, label)
+
+
+@owner_only
+async def rename_cmd(update, context):
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "Usage: /rename 0xADDRESS <name>   (use /rename 0xADDRESS - to clear)")
+        return
+    try:
+        addr = Web3.to_checksum_address(context.args[0])
+    except Exception:
+        await update.effective_message.reply_text("Invalid address.")
+        return
+    name = " ".join(context.args[1:]).strip()
+    if name == "-":
+        STATE["copy_labels"].pop(addr, None)
+        await update.effective_message.reply_text(f"Name cleared for {addr[:10]}..")
+        return
+    STATE["copy_labels"][addr] = name
+    await update.effective_message.reply_text(f"Named {addr[:10]}.. as \"{name}\"")
+
+
+@owner_only
+async def mintloop_cmd(update, context):
+    """Fire N mint txs per wallet back-to-back (for drops with a high per-wallet cap
+    but a low per-transaction limit)."""
+    if not STATE["contract"]:
+        await update.effective_message.reply_text("Run /source first.")
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /mintloop <count> [delayMs]\n"
+            "Sends <count> mint txs from EVERY wallet, one after another.\n"
+            "e.g. /mintloop 10  -> 10 mints per wallet. /cancelauto to stop early.\n"
+            "Note: each tx costs gas - check the drop is worth it first.")
+        return
+    try:
+        count = max(1, min(1000, int(context.args[0])))
+    except ValueError:
+        await update.effective_message.reply_text("Bad count.")
+        return
+    delay = 0.15
     if len(context.args) >= 2:
         try:
-            interval = max(0.3, float(context.args[1]))
+            delay = max(0.0, float(context.args[1]) / 1000.0)
         except ValueError:
             pass
-    await add_copy_target(context, update.effective_chat.id, target, interval)
+    total = count * len(STATE["wallets"])
+    await update.effective_message.reply_text(
+        f"Mint loop: {count} tx per wallet x {len(STATE['wallets'])} wallets = {total} txs.\n"
+        f"Each costs gas. Running... /cancelauto to stop.")
+
+    async def loop_one(wal):
+        _w3 = wallet_w3(wal)
+        _sw = _w3
+        ok = fail = 0
+        try:
+            nonce = await run_blocking(
+                lambda: _w3.eth.get_transaction_count(wal["address"], "pending"))
+        except Exception as e:
+            return f"[{wal['name']}] nonce error: {str(e)[:50]}"
+        for i in range(count):
+            try:
+                tx = await run_blocking(build_wallet_tx, _w3, wal, nonce)
+                raw = sign_wallet(_w3, wal, tx)
+                await run_blocking(do_send, _sw, raw)
+                ok += 1
+                nonce += 1
+            except Exception as e:
+                fail += 1
+                msg = str(e).lower()
+                # stop this wallet early on a hard stop (cap hit / out of funds)
+                if any(k in msg for k in ("exceed", "max", "insufficient", "limit")):
+                    return f"[{wal['name']}] {ok} sent, stopped at #{i+1}: {str(e)[:60]}"
+                if fail >= 3:
+                    return f"[{wal['name']}] {ok} sent, aborted after 3 errors: {str(e)[:50]}"
+            if delay:
+                await asyncio.sleep(delay)
+        return f"[{wal['name']}] {ok}/{count} sent" + (f", {fail} failed" if fail else "")
+
+    tasks = {w["name"]: asyncio.create_task(loop_one(w)) for w in STATE["wallets"]}
+    STATE["auto_tasks"] = tasks  # so /cancelauto can stop the loop
+    res = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    STATE["auto_tasks"] = {}
+    out = [str(r) if not isinstance(r, Exception) else f"error: {str(r)[:60]}" for r in res]
+    await update.effective_message.reply_text("\n".join(["Mint loop done:"] + out))
 
 
 @owner_only
@@ -1524,7 +1625,8 @@ def main():
         ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
-        ("cancelcopy", cancelcopy_cmd),
+        ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
+        ("rename", rename_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

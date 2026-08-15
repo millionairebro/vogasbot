@@ -28,6 +28,7 @@ import time
 import asyncio
 import logging
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -102,6 +103,12 @@ def get_code(_w3, addr):
 # OpenSea SeaDrop (mints route through this contract, not the NFT contract)
 SEADROP_ADDR = Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
 OPENSEA_FEE_RECIPIENT = Web3.to_checksum_address("0x0000a26b00c1F0DF003000390027140000fAa719")
+SEADROP_FEE_ABI = [{
+    "inputs": [{"name": "nftContract", "type": "address"}],
+    "name": "getAllowedFeeRecipients",
+    "outputs": [{"name": "", "type": "address[]"}],
+    "stateMutability": "view", "type": "function",
+}]
 SEADROP_ABI = [{
     "inputs": [{"name": "nftContract", "type": "address"}],
     "name": "getPublicDrop",
@@ -122,11 +129,25 @@ def read_public_drop(_w3, collection):
     return c.functions.getPublicDrop(Web3.to_checksum_address(collection)).call()
 
 
+def resolve_fee_recipient(_w3, collection):
+    """SeaDrop reverts on a disallowed fee recipient - read it from chain, don't guess."""
+    try:
+        c = _w3.eth.contract(address=SEADROP_ADDR, abi=SEADROP_FEE_ABI)
+        allowed = c.functions.getAllowedFeeRecipients(
+            Web3.to_checksum_address(collection)).call()
+        if allowed:
+            return Web3.to_checksum_address(allowed[0])
+    except Exception:
+        pass
+    return OPENSEA_FEE_RECIPIENT
+
+
 def seadrop_calldata(collection, minter, qty):
     sel = selector("mintPublic(address,address,address,uint256)")
+    fee = STATE.get("seadrop_fee") or OPENSEA_FEE_RECIPIENT
     enc = abi_encode(
         ["address", "address", "address", "uint256"],
-        [Web3.to_checksum_address(collection), OPENSEA_FEE_RECIPIENT,
+        [Web3.to_checksum_address(collection), Web3.to_checksum_address(fee),
          Web3.to_checksum_address(minter), int(qty)],
     ).hex()
     return "0x" + sel + enc
@@ -150,6 +171,7 @@ STATE = {
     "awaiting_copy": False,
     "seadrop":      False,
     "seadrop_collection": None,
+    "seadrop_fee":  None,
     "pending":      {},
     "pending_seq":  0,
 }
@@ -180,6 +202,78 @@ def pool_w3(i):
 
 def wallet_w3(wal):
     return pool_w3(wal.get("rpc_idx", 0))
+
+
+# ---- speed layer -------------------------------------------------------
+# Robinhood's sequencer is where ordering is decided; sending straight to it
+# removes a hop. Always included in the blast set.
+SEQUENCER_URL = os.environ.get(
+    "RH_SEQUENCER_URL", "https://sequencer.mainnet.chain.robinhood.com").strip()
+
+
+def blast_targets():
+    """Every endpoint a raw tx should be fired at, sequencer first."""
+    seen, out = set(), []
+    for u in ([SEQUENCER_URL] if SEQUENCER_URL else []) + list(RPC_POOL) + [SUBMIT_RPC_URL]:
+        u = (u or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _post_raw(url, body, timeout=10):
+    req = urllib.request.Request(
+        url, data=body.encode(), headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def blast_raw(raw_tx):
+    """Fire one signed tx at EVERY endpoint at once; first to reach the sequencer wins.
+    Duplicates are harmless - the chain dedupes by tx hash ('already known')."""
+    raw_hex = raw_tx.hex() if isinstance(raw_tx, (bytes, bytearray)) else str(raw_tx)
+    if not raw_hex.startswith("0x"):
+        raw_hex = "0x" + raw_hex
+    txh = "0x" + Web3.keccak(hexstr=raw_hex).hex().replace("0x", "")
+    body = json.dumps({"jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+                       "params": [raw_hex], "id": 1})
+    targets = blast_targets()
+    errs = []
+    with ThreadPoolExecutor(max_workers=max(2, len(targets))) as ex:
+        futs = [ex.submit(_post_raw, u, body) for u in targets]
+        for f in futs:
+            try:
+                j = f.result(timeout=10)
+                if j.get("result"):
+                    return j["result"]
+                if j.get("error"):
+                    m = str(j["error"].get("message", j["error"]))
+                    if "already known" in m.lower() or "already" in m.lower():
+                        return txh  # another endpoint got it there first
+                    errs.append(m)
+            except Exception as e:
+                errs.append(str(e)[:60])
+    if errs:
+        raise RuntimeError(errs[0][:160])
+    return txh
+
+
+def warm_all():
+    """Pre-open TCP/TLS to every endpoint so the fire pays no handshake cost.
+    Uses a deliberately invalid sendRawTransaction - the error is fine, the
+    established connection is the point (works on send-only sequencers too)."""
+    body = json.dumps({"jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+                       "params": ["0x00"], "id": 1})
+    targets = blast_targets()
+    with ThreadPoolExecutor(max_workers=max(2, len(targets))) as ex:
+        futs = [ex.submit(_post_raw, u, body, 5) for u in targets]
+        for f in futs:
+            try:
+                f.result(timeout=5)
+            except Exception:
+                pass
+    return len(targets)
 
 
 async def run_blocking(fn, *args):
@@ -293,8 +387,12 @@ def sim_wallet(_w3, wal):
 
 
 def do_send(_w3, raw):
-    h = _w3.eth.send_raw_transaction(raw).hex()
-    return h if h.startswith("0x") else "0x" + h
+    # blast to sequencer + all pool endpoints at once (fastest path in)
+    try:
+        return blast_raw(raw)
+    except Exception:
+        h = _w3.eth.send_raw_transaction(raw).hex()
+        return h if h.startswith("0x") else "0x" + h
 
 
 # ------------------------------------------------------------------ discovery
@@ -521,6 +619,10 @@ async def _try_seadrop(_w3, addr, msg):
         STATE["seadrop_collection"] = addr
         STATE["contract"] = SEADROP_ADDR
         STATE["value_wei"] = int(pd[0])
+        try:
+            STATE["seadrop_fee"] = await run_blocking(resolve_fee_recipient, _w3, addr)
+        except Exception:
+            STATE["seadrop_fee"] = OPENSEA_FEE_RECIPIENT
         msg.append(f"OpenSea SeaDrop mint - price {Decimal(int(pd[0]))/Decimal(10**18)} ETH, "
                    f"max {int(pd[3])}/wallet. Calldata auto-built for every wallet.")
         return True
@@ -744,10 +846,11 @@ async def armall_cmd(update, context):
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
     try:
-        await run_blocking(lambda: submit_w3().eth.block_number)  # warm submit socket
+        n_warm = await run_blocking(warm_all)
     except Exception:
-        pass
-    await update.effective_message.reply_text("\n".join(["Armed (submit socket warmed):"] + list(res)))
+        n_warm = 0
+    await update.effective_message.reply_text(
+        "\n".join([f"Armed ({n_warm} endpoints warmed, blast-send enabled):"] + list(res)))
 
 
 async def _fire_all(update, only_eligible=True):
@@ -1085,12 +1188,43 @@ async def setgas_cmd(update, context):
 
 # ------------------------------------------------------------------ copy-mint
 def fetch_txlist(target, n=5):
+    """Explorer API - used only as a fallback / initial seed. Slow (indexer lag)."""
     url = f"{BLOCKSCOUT}?module=account&action=txlist&address={target}&sort=desc&page=1&offset={n}"
     with urllib.request.urlopen(url, timeout=10) as r:
         d = json.loads(r.read().decode())
     if str(d.get("status")) == "1" and isinstance(d.get("result"), list):
         return d["result"]
     return []
+
+
+def scan_blocks_for(_w3, targets_lower, from_block, to_block):
+    """Read new blocks straight from the chain and pull out txs sent by any tracked
+    wallet. Far faster than the explorer API (no indexer lag) and not rate-limited
+    the same way. Returns (list_of_tx_dicts, last_block_scanned)."""
+    found = []
+    b = from_block
+    while b <= to_block:
+        try:
+            blk = _w3.eth.get_block(b, full_transactions=True)
+        except Exception:
+            break
+        for t in blk.transactions:
+            frm = (t.get("from") or "")
+            if frm and frm.lower() in targets_lower:
+                data = t.get("input")
+                if isinstance(data, (bytes, bytearray)):
+                    data = "0x" + data.hex()
+                data = data or "0x"
+                h = t.get("hash")
+                found.append({
+                    "hash": h.hex() if hasattr(h, "hex") else str(h),
+                    "from": frm,
+                    "to": t.get("to"),
+                    "input": data,
+                    "value": str(t.get("value") or 0),
+                })
+        b += 1
+    return found, min(b - 1, to_block)
 
 
 def build_custom_tx(_w3, wal, to, data, value, nonce=None):
@@ -1149,25 +1283,32 @@ async def copy_fire(context, chat_id, to, data, value):
 
 async def _copy_loop(context, chat_id, target, interval):
     seen = set()
+    _w3 = w3()
+    tl = {target.lower()}
     try:
-        for t in await run_blocking(fetch_txlist, target, 10):
-            if t.get("hash"):
-                seen.add(t["hash"])
+        last_block = await run_blocking(lambda: _w3.eth.block_number)
     except Exception:
-        pass
+        last_block = None
     await context.bot.send_message(
         chat_id,
         f"Copy-mint watching {target}\n"
-        "FREE mints fire instantly in the background. PAID mints ask for your approval (buttons). "
-        "Always watching until /cancel. (No mempool here, so you follow after their tx lands.)"
+        "Scanning new blocks directly (fast). FREE mints fire instantly; PAID mints ask for "
+        "approval (buttons). Watching until /cancel. (No mempool here, so you follow the moment "
+        "their tx lands - you can't pre-empt it.)"
     )
     while True:
+        txs = []
         try:
-            txs = await run_blocking(fetch_txlist, target, 5)
+            head = await run_blocking(lambda: _w3.eth.block_number)
+            if last_block is None:
+                last_block = head
+            if head > last_block:
+                txs, last_block = await run_blocking(
+                    scan_blocks_for, _w3, tl, last_block + 1, head)
         except Exception:
             await asyncio.sleep(interval)
             continue
-        for t in reversed(txs):
+        for t in list(txs):
             h = t.get("hash")
             if not h or h in seen:
                 continue
@@ -1261,7 +1402,7 @@ async def cb_handler(update, context):
             return
 
 
-async def add_copy_target(context, chat_id, target, interval=3.0):
+async def add_copy_target(context, chat_id, target, interval=1.0):
     existing = STATE["copy_tasks"].get(target)
     if existing and not existing.done():
         await context.bot.send_message(chat_id, f"Already tracking {target[:10]}..")
@@ -1307,10 +1448,10 @@ async def copy_cmd(update, context):
     except Exception:
         await update.effective_message.reply_text("Invalid address.")
         return
-    interval = 3.0
+    interval = 1.0
     if len(context.args) >= 2:
         try:
-            interval = max(1.0, float(context.args[1]))
+            interval = max(0.3, float(context.args[1]))
         except ValueError:
             pass
     await add_copy_target(context, update.effective_chat.id, target, interval)

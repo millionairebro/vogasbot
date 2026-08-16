@@ -54,6 +54,8 @@ RPC_URL        = os.environ.get("RH_RPC_URL", "https://rpc.mainnet.chain.robinho
 SUBMIT_RPC_URL = (os.environ.get("RH_SUBMIT_RPC_URL", "").strip() or RPC_URL)
 _pool_raw = os.environ.get("RH_RPC_POOL", "").strip()
 RPC_POOL = [u.strip() for u in re.split(r"[,\s]+", _pool_raw) if u.strip()] or [RPC_URL]
+RPC_POOL_RAW = list(RPC_POOL) + [RPC_URL, SUBMIT_RPC_URL]
+MAX_SPEND_ETH = Decimal(os.environ.get("RH_MAX_SPEND_ETH", "0.5") or "0.5")
 CHAIN_ID       = int(os.environ.get("RH_CHAIN_ID", "4663") or "4663")
 BLOCKSCOUT     = os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api").strip()
 EXPLORER       = os.environ.get("RH_EXPLORER", "https://robinhoodchain.blockscout.com").rstrip("/")
@@ -61,6 +63,32 @@ DEFAULT_GAS    = int(os.environ.get("RH_GAS_LIMIT", "500000") or "500000")
 OPENSEA_KEY    = os.environ.get("OPENSEA_API_KEY", "").strip()  # optional, for collection links
 
 PK_PATTERN = re.compile(r"\b(0x)?[0-9a-fA-F]{64}\b")
+
+# --- secret redaction -------------------------------------------------
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
+def redact_url(url):
+    """Keep the host so errors stay diagnosable; drop the path (holds the API key)."""
+    try:
+        m = re.match(r"(https?://[^/]+)", url)
+        return (m.group(1) + "/***") if m else "***"
+    except Exception:
+        return "***"
+
+
+def safe(text, limit=140):
+    """Strip API keys / URLs / key-like tokens before anything reaches Telegram or logs."""
+    s = str(text)
+    s = _URL_RE.sub(lambda m: redact_url(m.group(0)), s)
+    s = PK_PATTERN.sub("***", s)
+    if BOT_TOKEN:
+        s = s.replace(BOT_TOKEN, "***")
+    for _u in RPC_POOL_RAW:
+        tail = _u.rstrip("/").rsplit("/", 1)[-1]
+        if len(tail) >= 12:
+            s = s.replace(tail, "***")
+    return s[:limit]
 
 # simple (auto-buildable) vs proof (needs per-wallet calldata) mint signatures
 SIMPLE_SIGS = [
@@ -169,6 +197,8 @@ STATE = {
     "gas_limit_override": None,
     "copy_tasks":   {},
     "copy_labels":  {},
+    "os_sessions":  {},
+    "os_slug":      None,
     "awaiting_copy": False,
     "seadrop":      False,
     "seadrop_collection": None,
@@ -192,17 +222,44 @@ def submit_w3():
 
 
 _POOL_W3 = {}
+_EP_COOL = {}          # url -> epoch seconds until it's usable again
+RPC_COOLDOWN = float(os.environ.get("RH_RPC_COOLDOWN", "90") or "90")
 
 
-def pool_w3(i):
-    url = RPC_POOL[i % len(RPC_POOL)]
+def w3_for(url):
     if url not in _POOL_W3:
         _POOL_W3[url] = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
     return _POOL_W3[url]
 
 
+def healthy_endpoints():
+    now = time.time()
+    ok = [u for u in RPC_POOL if _EP_COOL.get(u, 0) <= now]
+    return ok or list(RPC_POOL)      # all cooling -> use anyway rather than stall
+
+
+def mark_rate_limited(url, seconds=None):
+    _EP_COOL[url] = time.time() + (seconds if seconds is not None else RPC_COOLDOWN)
+
+
+def is_rate_limit(err):
+    s = str(err).lower()
+    return "429" in s or "too many request" in s or "rate limit" in s or "capacity" in s
+
+
+def pool_w3(i):
+    return w3_for(healthy_endpoints()[i % len(healthy_endpoints())])
+
+
+def wallet_rpc(wal):
+    """(web3, url) for this wallet, round-robined over HEALTHY endpoints only."""
+    hs = healthy_endpoints()
+    url = hs[wal.get("rpc_idx", 0) % len(hs)]
+    return w3_for(url), url
+
+
 def wallet_w3(wal):
-    return pool_w3(wal.get("rpc_idx", 0))
+    return wallet_rpc(wal)[0]
 
 
 # ---- speed layer -------------------------------------------------------
@@ -215,7 +272,7 @@ SEQUENCER_URL = os.environ.get(
 def blast_targets():
     """Every endpoint a raw tx should be fired at, sequencer first."""
     seen, out = set(), []
-    for u in ([SEQUENCER_URL] if SEQUENCER_URL else []) + list(RPC_POOL) + [SUBMIT_RPC_URL]:
+    for u in ([SEQUENCER_URL] if SEQUENCER_URL else []) + healthy_endpoints() + [SUBMIT_RPC_URL]:
         u = (u or "").strip()
         if u and u not in seen:
             seen.add(u)
@@ -286,6 +343,10 @@ async def run_blocking(fn, *args):
 def load_wallets():
     out = []
     if os.path.exists(WALLETS_FILE):
+        try:
+            os.chmod(WALLETS_FILE, 0o600)
+        except Exception:
+            pass
         raw = json.load(open(WALLETS_FILE))
         for i, w in enumerate(raw):
             key = (w.get("key") or "").strip()
@@ -322,6 +383,21 @@ def suggest_fees(_w3):
     if base is None:
         return _w3.eth.gas_price, prio
     return int(base) * 2 + prio, prio
+
+
+def total_spend_eth(wallets=None):
+    ws = wallets if wallets is not None else STATE["wallets"]
+    return sum((Decimal(wallet_value(w)) / Decimal(10 ** 18)) for w in ws)
+
+
+def spend_guard(wallets=None):
+    """Refuse a batch that would spend more than RH_MAX_SPEND_ETH in one go."""
+    total = total_spend_eth(wallets)
+    if total > MAX_SPEND_ETH:
+        raise RuntimeError(
+            f"SPEND GUARD: this would spend {total} ETH across wallets, over the "
+            f"{MAX_SPEND_ETH} ETH limit. Raise RH_MAX_SPEND_ETH in .env if intended.")
+    return total
 
 
 def wallet_value(wal):
@@ -517,11 +593,261 @@ def _fmt_eta(target):
     return " ".join(out)
 
 
+
+# =====================================================================
+# OpenSea private API: SIWE auth -> eligibility -> mint calldata
+# ---------------------------------------------------------------------
+# This is how WL / FCFS ("signed presale") mints get automated. OpenSea's
+# backend issues a per-wallet signature; you get it by authenticating the
+# wallet with Sign-In-With-Ethereum and asking their GraphQL for the mint
+# action. It returns the COMPLETE calldata (signature included) which we
+# then validate locally and fire ourselves.
+# =====================================================================
+OS_SITE = "https://opensea.io"
+OS_GQL = "https://gql.opensea.io/graphql"
+OS_APP_ID = "os2-web"
+OS_SIWE_STATEMENT = (
+    "Click to sign in and accept the OpenSea Terms of Service "
+    "(https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy)."
+)
+STAGE_SELECTOR = {
+    "PUBLIC_SALE": "0x161ac21f",
+    "SIGNED_PRESALE": "0x4b61cd6f",
+    "MERKLE_PRESALE": "0x4300a4e6",
+}
+
+OS_COLLECTION_QUERY = """
+query MintCollectionMetadata($slug: String!) {
+  collectionBySlug(slug: $slug) {
+    __typename
+    ... on Collection {
+      slug address
+      chain { identifier networkId }
+      drop {
+        __typename
+        identifier { contractAddress chain { identifier } }
+        stages {
+          __typename stageType stageIndex startTime endTime
+          maxTotalMintableByWallet
+        }
+      }
+    }
+  }
+}
+"""
+
+OS_ELIGIBILITY_QUERY = """
+query DropEligibilityQuery($collectionSlug: String!, $address: Address!) {
+  dropBySlug(slug: $collectionSlug) {
+    __typename
+    ... on Erc721SeaDropV1 { minterQuantityMinted(minter: $address) }
+    stages {
+      __typename stageType stageIndex isEligible eligibleMinterAddress
+      maxTotalMintableByWallet eligibleMaxTotalMintableByWallet
+      eligiblePrice { token { unit symbol contractAddress chain { identifier } } }
+    }
+  }
+}
+"""
+
+OS_MINT_QUERY = """
+query MintActionTimelineQuery($address: Address!, $fromAssets: [AssetQuantityInput!]!,
+                              $toAssets: [AssetQuantityInput!]!, $recipient: Address) {
+  swap(address: $address, fromAssets: $fromAssets, toAssets: $toAssets,
+       recipient: $recipient, action: MINT) {
+    actions {
+      __typename
+      ... on TransactionAction {
+        transactionSubmissionData { to data value chain { networkId identifier } }
+      }
+    }
+    errors { __typename }
+  }
+}
+"""
+
+
+def os_slug(text):
+    """Accept a slug, an opensea.io/collection/<slug> URL, or return None."""
+    text = (text or "").strip()
+    m = re.search(r"opensea\.io/collection/([A-Za-z0-9\-_]+)", text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9\-_]{1,200}", text) and not text.startswith("0x"):
+        return text
+    return None
+
+
+def os_session():
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "accept": "application/json",
+        "origin": OS_SITE,
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    })
+    return s
+
+
+def os_login(wal, slug, chain_id):
+    """SIWE-authenticate one wallet against OpenSea. Returns a live session."""
+    from eth_account.messages import encode_defunct
+    from datetime import datetime, timezone as _tz
+    s = os_session()
+    ref = f"{OS_SITE}/collection/{slug}/overview"
+    addr = Web3.to_checksum_address(wal["address"])
+    s.cookies.set("connected-account-server-hint", addr.lower(), domain="opensea.io", path="/")
+    r = s.post(f"{OS_SITE}/__api/auth/siwe/nonce", headers={"referer": ref}, timeout=15)
+    r.raise_for_status()
+    nonce = r.json().get("nonce")
+    if not nonce:
+        raise RuntimeError("no nonce from OpenSea")
+    issued = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+        f"{datetime.now(_tz.utc).microsecond // 1000:03d}Z"
+    msg = (f"opensea.io wants you to sign in with your Ethereum account:\n{addr}\n\n"
+           f"{OS_SIWE_STATEMENT}\n\nURI: {ref}\nVersion: 1\nChain ID: {chain_id}\n"
+           f"Nonce: {nonce}\nIssued At: {issued}")
+    signed = Web3().eth.account.sign_message(encode_defunct(text=msg), private_key=wal["key"])
+    sig = signed.signature.hex()
+    if not sig.startswith("0x"):
+        sig = "0x" + sig
+    body = {
+        "message": {
+            "domain": "opensea.io", "address": addr, "statement": OS_SIWE_STATEMENT,
+            "uri": ref, "version": "1", "chainId": str(chain_id), "nonce": nonce,
+            "issuedAt": issued, "accountType": "Ethereum",
+        },
+        "signature": sig, "chainArch": "EVM",
+    }
+    r = s.post(f"{OS_SITE}/__api/auth/siwe/verify", json=body,
+               headers={"referer": ref, "content-type": "application/json"}, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"SIWE verify HTTP {r.status_code}")
+    got = (r.json().get("user") or {}).get("address", "")
+    if got.lower() != addr.lower():
+        raise RuntimeError("session wallet mismatch")
+    return s
+
+
+def os_graphql(session, slug, op, query, variables):
+    ref = f"{OS_SITE}/collection/{slug}/overview"
+    r = session.post(OS_GQL, json={"operationName": op, "query": query, "variables": variables},
+                     headers={"referer": ref, "x-app-id": OS_APP_ID,
+                              "content-type": "application/json"}, timeout=20)
+    if r.status_code == 429:
+        raise RuntimeError("OpenSea rate limited")
+    r.raise_for_status()
+    j = r.json()
+    if j.get("errors"):
+        raise RuntimeError(str(j["errors"])[:120])
+    if not j.get("data"):
+        raise RuntimeError("empty OpenSea response")
+    return j["data"]
+
+
+def os_collection(session, slug):
+    d = os_graphql(session, slug, "MintCollectionMetadata", OS_COLLECTION_QUERY, {"slug": slug})
+    c = d.get("collectionBySlug")
+    if not c:
+        raise RuntimeError("collection not found")
+    drop = c.get("drop") or {}
+    return {
+        "slug": c.get("slug"),
+        "address": Web3.to_checksum_address(c["address"]),
+        "chain": (c.get("chain") or {}).get("identifier"),
+        "network_id": int((c.get("chain") or {}).get("networkId") or 0),
+        "drop_kind": drop.get("__typename"),
+        "drop_address": Web3.to_checksum_address((drop.get("identifier") or {})["contractAddress"]),
+        "stages": drop.get("stages") or [],
+    }
+
+
+def os_eligibility(session, slug, wal):
+    d = os_graphql(session, slug, "DropEligibilityQuery", OS_ELIGIBILITY_QUERY,
+                   {"collectionSlug": slug, "address": wal["address"].lower()})
+    drop = d.get("dropBySlug") or {}
+    out = []
+    for st in drop.get("stages") or []:
+        price = None
+        ep = st.get("eligiblePrice")
+        if ep and ep.get("token") is not None:
+            try:
+                price = int(Web3.to_wei(Decimal(str(ep["token"]["unit"])), "ether"))
+            except Exception:
+                price = None
+        out.append({
+            "type": st.get("stageType"),
+            "index": int(st.get("stageIndex") or 0),
+            "eligible": bool(st.get("isEligible")),
+            "max": st.get("eligibleMaxTotalMintableByWallet") or st.get("maxTotalMintableByWallet"),
+            "price_wei": price,
+        })
+    return out, drop.get("minterQuantityMinted")
+
+
+def os_mint_action(session, coll, wal, qty, token_id="0"):
+    """Ask OpenSea to build the mint tx for THIS wallet. For a signed presale the
+    returned calldata already contains that wallet's server signature."""
+    native = "0x0000000000000000000000000000000000000000"
+    variables = {
+        "address": Web3.to_checksum_address(wal["address"]),
+        "fromAssets": [{"asset": {"contractAddress": native, "chain": coll["chain"]}}],
+        "toAssets": [{"asset": {"contractAddress": coll["drop_address"], "chain": coll["chain"],
+                                "tokenId": token_id}, "quantity": str(qty)}],
+        "recipient": None,
+    }
+    d = os_graphql(session, coll["slug"], "MintActionTimelineQuery", OS_MINT_QUERY, variables)
+    swap = d.get("swap") or {}
+    errs = [e.get("__typename") for e in (swap.get("errors") or [])]
+    if errs:
+        raise RuntimeError(errs[0])
+    for a in swap.get("actions") or []:
+        tsd = a.get("transactionSubmissionData")
+        if tsd:
+            return {
+                "to": Web3.to_checksum_address(tsd["to"]),
+                "data": tsd["data"],
+                "value": int(tsd.get("value") or 0),
+                "network_id": int((tsd.get("chain") or {}).get("networkId") or 0),
+            }
+    raise RuntimeError("no transaction action returned")
+
+
+def os_validate(action, coll, wal, stage_type, qty, chain_id):
+    """Never fire whatever OpenSea hands back without checking it ourselves."""
+    data = action["data"]
+    if not data.startswith("0x") or len(data) < 10:
+        raise RuntimeError("bad calldata")
+    if action["network_id"] and action["network_id"] != chain_id:
+        raise RuntimeError(f"wrong chain {action['network_id']}")
+    want = STAGE_SELECTOR.get(stage_type)
+    if want and data[:10].lower() != want:
+        raise RuntimeError(f"selector {data[:10]} != {stage_type}")
+    # word-level checks below assume the ERC721 SeaDrop layout; skip for others
+    if coll.get("drop_kind") not in (None, "Erc721SeaDropV1"):
+        return True
+    body = data[10:]
+
+    def word(i):
+        return body[i * 64:(i + 1) * 64]
+
+    nft = Web3.to_checksum_address("0x" + word(0)[24:])
+    if nft.lower() != coll["address"].lower():
+        raise RuntimeError("nft contract mismatch")
+    minter = "0x" + word(2)[24:]
+    if int(minter, 16) != 0 and minter.lower() != wal["address"].lower():
+        raise RuntimeError("minter mismatch")
+    if int(word(3), 16) != int(qty):
+        raise RuntimeError("quantity mismatch")
+    return True
+
+
 # ------------------------------------------------------------------ auth
 def owner_only(fn):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
-        if OWNER_ID and uid != OWNER_ID:
+        if (not OWNER_ID) or uid != OWNER_ID:   # fail closed
             if update.message:
                 await update.effective_message.reply_text("Unauthorized.")
             log.warning("Rejected command from user %s", uid)
@@ -569,6 +895,8 @@ async def help_cmd(update, context):
         "/cancelschedule - stop scheduled mint only\n"
         "/cancelcopy - stop copy-mint only\n"
         "/cancel - stop EVERYTHING\n"
+        "/oscheck <collection> - OpenSea WL/FCFS/public eligibility per wallet\n"
+        "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
         "/copy 0xADDR [name] - track a wallet (named alerts)\n"
         "/rename 0xADDR <name> - rename a tracked wallet\n"
@@ -824,7 +1152,7 @@ async def simall_cmd(update, context):
             await run_blocking(sim_wallet, _w3, wal)
             return f"[{wal['name']}] ELIGIBLE - would mint now"
         except Exception as e:
-            return f"[{wal['name']}] not yet: {str(e)[:70]}"
+            return f"[{wal['name']}] not yet: {safe(e, 70)}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
     await update.effective_message.reply_text("\n".join(["Eligibility (simulation, spends nothing):"] + list(res)))
@@ -846,7 +1174,7 @@ async def armall_cmd(update, context):
             return f"[{wal['name']}] armed nonce {tx['nonce']}"
         except Exception as e:
             wal["armed"] = None
-            return f"[{wal['name']}] arm failed: {str(e)[:70]}"
+            return f"[{wal['name']}] arm failed: {safe(e, 70)}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
     try:
@@ -878,7 +1206,7 @@ async def _fire_all(update, only_eligible=True):
             asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
             return (wal["name"], f"SENT {txh}")
         except Exception as e:
-            return (wal["name"], f"FAIL {str(e)[:80]}")
+            return (wal["name"], f"FAIL {safe(e, 80)}")
 
     return await asyncio.gather(*[one(w) for w in STATE["wallets"]])
 
@@ -888,21 +1216,92 @@ async def mintall_cmd(update, context):
     if not STATE["contract"]:
         await update.effective_message.reply_text("Run /source first.")
         return
+    try:
+        total = spend_guard()
+    except Exception as e:
+        await update.effective_message.reply_text(str(e))
+        return
+    if total > 0:
+        await update.effective_message.reply_text(f"Spending ~{total} ETH across wallets...")
     res = await _fire_all(update, only_eligible=True)
     await update.effective_message.reply_text("\n".join(["Mint all:"] + [f"[{n}] {r}" for n, r in res]))
 
 
+def wallets_share_gate():
+    """True when all wallets would send the identical call - one probe covers them."""
+    ws = STATE["wallets"]
+    if len(ws) < 2:
+        return False
+    try:
+        _w3 = w3()
+        first = (wallet_calldata(_w3, ws[0]), wallet_value(ws[0]))
+        return all((wallet_calldata(_w3, w), wallet_value(w)) == first for w in ws[1:])
+    except Exception:
+        return False
+
+
+def adaptive(interval, elapsed):
+    """Poll gently while waiting, tighten up once we're clearly in the window.
+    Saves enormous quota on long waits without losing reaction speed."""
+    if elapsed < 60:
+        return max(interval, 1.0)          # first minute: 1s is plenty
+    if elapsed < 600:
+        return max(interval, 2.0)          # long wait: 2s
+    return max(interval, 5.0)              # very long wait: 5s
+
+
+async def _shared_gate_hunt(update, interval, deadline=None):
+    """ONE probe for all wallets, then fire everything the instant it opens."""
+    ws = STATE["wallets"]
+    canary = ws[0]
+    _w3, _url = wallet_rpc(canary)
+    started = time.time()
+    polls = 0
+    await update.effective_message.reply_text(
+        f"Watching ONE shared gate for all {len(ws)} wallets (same call) - "
+        f"~{len(ws)}x fewer RPC calls. Fires everything the moment it opens.")
+    while True:
+        if deadline and time.time() > deadline:
+            await update.effective_message.reply_text("Window closed - mint never opened.")
+            return
+        try:
+            await run_blocking(sim_wallet, _w3, canary)
+        except Exception as e:
+            if is_rate_limit(e):
+                mark_rate_limited(_url)
+                _w3, _url = wallet_rpc(canary)      # rotate to a healthy endpoint
+            polls += 1
+            await asyncio.sleep(adaptive(interval, time.time() - started))
+            continue
+        await update.effective_message.reply_text(
+            f"MINT OPEN after {polls} probes - firing {len(ws)} wallets")
+        try:
+            spend_guard()
+        except Exception as e:
+            await update.effective_message.reply_text(str(e))
+            return
+        res = await _fire_all(update, only_eligible=False)
+        await update.effective_message.reply_text(
+            "\n".join(["Fired:"] + [f"[{n}] {r}" for n, r in res]))
+        return
+
+
 async def _wallet_hunt(update, wal, interval, deadline=None):
-    _w3 = wallet_w3(wal)
+    _w3, _url = wallet_rpc(wal)
     _sw = _w3
+    started = time.time()
     while True:
         if deadline and time.time() > deadline:
             await update.effective_message.reply_text(f"[{wal['name']}] window closed - not eligible/open.")
             return
         try:
             await run_blocking(sim_wallet, _w3, wal)  # no revert -> this wallet can mint now
-        except Exception:
-            await asyncio.sleep(interval)
+        except Exception as e:
+            if is_rate_limit(e):
+                mark_rate_limited(_url)
+                _w3, _url = wallet_rpc(wal)
+                _sw = _w3
+            await asyncio.sleep(adaptive(interval, time.time() - started))
             continue
         try:
             raw = wal.get("armed")
@@ -914,7 +1313,7 @@ async def _wallet_hunt(update, wal, interval, deadline=None):
             await update.effective_message.reply_text(f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
         except Exception as e:
-            await update.effective_message.reply_text(f"[{wal['name']}] fire failed: {str(e)[:120]}")
+            await update.effective_message.reply_text(f"[{wal['name']}] fire failed: {safe(e, 120)}")
         return
 
 
@@ -932,14 +1331,18 @@ async def autoall_cmd(update, context):
             interval = max(0.05, float(context.args[0]) / 1000.0)
         except ValueError:
             pass
-    STATE["auto_tasks"] = {
-        wal["name"]: asyncio.create_task(_wallet_hunt(update, wal, interval, None))
-        for wal in STATE["wallets"]
-    }
-    await update.effective_message.reply_text(
-        f"Auto-mint watching {len(STATE['wallets'])} wallets. Each fires the instant IT is eligible. "
-        f"Poll {int(interval*1000)}ms. (Use a dedicated RPC for many wallets.) /cancel to stop."
-    )
+    shared = await run_blocking(wallets_share_gate)
+    if shared:
+        STATE["auto_tasks"] = {
+            "_gate": asyncio.create_task(_shared_gate_hunt(update, interval, None))}
+    else:
+        STATE["auto_tasks"] = {
+            wal["name"]: asyncio.create_task(_wallet_hunt(update, wal, interval, None))
+            for wal in STATE["wallets"]
+        }
+        await update.effective_message.reply_text(
+            f"Auto-mint watching {len(STATE['wallets'])} wallets separately (different calls). "
+            f"Poll {int(interval*1000)}ms, auto-eased while waiting. /cancelauto to stop.")
 
 
 async def _scheduled_all(update, target, lead, interval, window):
@@ -966,12 +1369,17 @@ async def _scheduled_all(update, target, lead, interval, window):
         pass
     await update.effective_message.reply_text("Go-time. Re-armed all wallets. Watching per-wallet eligibility now...")
     STATE["auto_tasks"] = {}
-    tasks = []
-    for wal in STATE["wallets"]:
-        t = asyncio.create_task(_wallet_hunt(update, wal, interval, target + window))
-        STATE["auto_tasks"][wal["name"]] = t
-        tasks.append(t)
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if await run_blocking(wallets_share_gate):
+        t = asyncio.create_task(_shared_gate_hunt(update, interval, target + window))
+        STATE["auto_tasks"]["_gate"] = t
+        await asyncio.gather(t, return_exceptions=True)
+    else:
+        tasks = []
+        for wal in STATE["wallets"]:
+            t = asyncio.create_task(_wallet_hunt(update, wal, interval, target + window))
+            STATE["auto_tasks"][wal["name"]] = t
+            tasks.append(t)
+        await asyncio.gather(*tasks, return_exceptions=True)
     STATE["sched_task"] = None
     STATE["sched_target"] = None
 
@@ -1113,7 +1521,12 @@ def append_wallets(entries):
         except Exception:
             data = []
     data.extend(entries)
-    json.dump(data, open(WALLETS_FILE, "w"), indent=2)
+    with open(WALLETS_FILE, "w") as fh:
+        json.dump(data, fh, indent=2)
+    try:
+        os.chmod(WALLETS_FILE, 0o600)  # keys: owner-read-only
+    except Exception:
+        pass
 
 
 @owner_only
@@ -1246,6 +1659,29 @@ def build_custom_tx(_w3, wal, to, data, value, nonce=None):
     }
 
 
+SIGNED_SELECTOR = "0x" + Web3.keccak(
+    text="mintSigned(address,address,address,uint256,"
+         "(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)"
+)[:4].hex().replace("0x", "").lower()
+PUBLIC_SELECTOR = "0x" + Web3.keccak(
+    text="mintPublic(address,address,address,uint256)"
+)[:4].hex().replace("0x", "").lower()
+
+
+def calldata_collection(data):
+    """First arg of any SeaDrop mint is the nft contract."""
+    body = data[2:] if data.startswith("0x") else data
+    try:
+        return Web3.to_checksum_address("0x" + body[8:72][24:])
+    except Exception:
+        return None
+
+
+def is_signed_mint(data):
+    body = data[2:] if data.startswith("0x") else data
+    return ("0x" + body[:8].lower()) == SIGNED_SELECTOR
+
+
 def copy_wallet_calldata(to, data, wal):
     # if the target used OpenSea SeaDrop mintPublic, rebuild with OUR wallet as minter
     body = data[2:] if data.startswith("0x") else data
@@ -1280,9 +1716,15 @@ async def copy_fire(context, chat_id, to, data, value):
             await context.bot.send_message(chat_id, f"[{wal['name']}] minting.. SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _w3, txh, wal["name"]))
         except Exception as e:
-            await context.bot.send_message(chat_id, f"[{wal['name']}] fail {str(e)[:80]}")
+            return f"{wal['name']}: {safe(e, 60)}"
+        return None
 
-    await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+    fails = [f for f in await asyncio.gather(*[one(w) for w in STATE["wallets"]]) if f]
+    if fails:
+        head = fails[0].split(":", 1)[1].strip() if ":" in fails[0] else fails[0]
+        await context.bot.send_message(
+            chat_id,
+            f"{len(fails)}/{len(STATE['wallets'])} wallets failed - {safe(head, 90)}")
 
 
 async def _copy_loop(context, chat_id, target, interval):
@@ -1293,9 +1735,10 @@ async def _copy_loop(context, chat_id, target, interval):
         last_block = await run_blocking(lambda: _w3.eth.block_number)
     except Exception:
         last_block = None
+    backoff = interval
     await context.bot.send_message(
         chat_id,
-        f"Copy-mint watching {target}\n"
+        f"Copy-mint watching {copy_label(target)} ({target})\n"
         "Scanning new blocks directly (fast). FREE mints fire instantly; PAID mints ask for "
         "approval (buttons). Watching until /cancel. (No mempool here, so you follow the moment "
         "their tx lands - you can't pre-empt it.)"
@@ -1307,10 +1750,25 @@ async def _copy_loop(context, chat_id, target, interval):
             if last_block is None:
                 last_block = head
             if head > last_block:
-                txs, last_block = await run_blocking(
-                    scan_blocks_for, _w3, tl, last_block + 1, head)
-        except Exception:
-            await asyncio.sleep(interval)
+                # never scan more than 25 blocks in one pass - if we fell behind,
+                # skip ahead rather than hammering the RPC with a huge catch-up
+                start = last_block + 1
+                if head - start > 25:
+                    start = head - 25
+                txs, last_block = await run_blocking(scan_blocks_for, _w3, tl, start, head)
+            backoff = interval
+        except Exception as e:
+            # 429 / rate limit -> ease off instead of retrying at full speed
+            if is_rate_limit(e):
+                try:
+                    mark_rate_limited(RPC_POOL[0])
+                except Exception:
+                    pass
+                _w3 = w3()
+                backoff = min(backoff * 2 if backoff else interval, 15.0)
+                await asyncio.sleep(backoff)
+            else:
+                await asyncio.sleep(interval)
             continue
         for t in list(txs):
             h = t.get("hash")
@@ -1326,6 +1784,58 @@ async def _copy_loop(context, chat_id, target, interval):
                 continue
             to = Web3.to_checksum_address(to)
             val = int(t.get("value") or "0")
+
+            # Signature-gated WL mint: the 65-byte signature is bound to THEIR
+            # wallet, so replaying it always reverts. Try the collection's PUBLIC
+            # stage instead (that one is copyable); otherwise just report it.
+            if is_signed_mint(data):
+                coll = calldata_collection(data)
+                pd = None
+                if coll:
+                    try:
+                        pd = await run_blocking(read_public_drop, _w3, coll)
+                    except Exception:
+                        pd = None
+                live = False
+                if pd:
+                    now = int(time.time())
+                    live = int(pd[3]) > 0 and int(pd[1]) <= now <= int(pd[2])
+                if live:
+                    try:
+                        fee = await run_blocking(resolve_fee_recipient, _w3, coll)
+                    except Exception:
+                        fee = OPENSEA_FEE_RECIPIENT
+                    price = int(pd[0])
+                    pub_price = Decimal(price) / Decimal(10 ** 18)
+                    await context.bot.send_message(
+                        chat_id,
+                        f"Copy: {copy_label(target)} minted a WL (signature) drop - that signature "
+                        f"is bound to their wallet, so it can't be copied.\n"
+                        f"But {coll[:10]}.. has a LIVE PUBLIC stage ({pub_price} ETH) - using that instead.")
+                    STATE["seadrop_fee"] = fee
+                    pub_data = seadrop_calldata(coll, STATE["wallets"][0]["address"], 1) if STATE["wallets"] else None
+                    if pub_data:
+                        if price == 0:
+                            asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub_data, 0))
+                        else:
+                            pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
+                            STATE["pending"][pid] = {"to": SEADROP_ADDR, "data": pub_data, "value": price,
+                                                     "desc": f"{pub_price} ETH -> {coll[:10]}.. (public)"}
+                            kb = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
+                                InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
+                            await context.bot.send_message(
+                                chat_id,
+                                f"Public stage is PAID: {pub_price} ETH x {len(STATE['wallets'])} wallets "
+                                f"= {pub_price * len(STATE['wallets'])} ETH. Mint?", reply_markup=kb)
+                else:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"Copy: {copy_label(target)} minted a WL (signature) drop at "
+                        f"{(coll or to)[:10]}.. - SKIPPED. The signature only works for their wallet, "
+                        f"and no public stage is live. Mint this one manually on OpenSea if you're allowlisted.")
+                continue
+
             if val == 0:
                 await context.bot.send_message(
                     chat_id, f"Copy: {copy_label(target)} FREE-minted {to[:10]}.. -> firing all wallets")
@@ -1356,7 +1866,7 @@ async def cb_handler(update, context):
     if not q:
         return
     await q.answer()
-    if OWNER_ID and q.from_user and q.from_user.id != OWNER_ID:
+    if (not OWNER_ID) or (not q.from_user) or q.from_user.id != OWNER_ID:
         return
     parts = (q.data or "").split("|")
     if len(parts) == 3 and parts[0] == "cp":
@@ -1530,7 +2040,7 @@ async def mintloop_cmd(update, context):
             nonce = await run_blocking(
                 lambda: _w3.eth.get_transaction_count(wal["address"], "pending"))
         except Exception as e:
-            return f"[{wal['name']}] nonce error: {str(e)[:50]}"
+            return f"[{wal['name']}] nonce error: {safe(e, 50)}"
         for i in range(count):
             try:
                 tx = await run_blocking(build_wallet_tx, _w3, wal, nonce)
@@ -1543,9 +2053,9 @@ async def mintloop_cmd(update, context):
                 msg = str(e).lower()
                 # stop this wallet early on a hard stop (cap hit / out of funds)
                 if any(k in msg for k in ("exceed", "max", "insufficient", "limit")):
-                    return f"[{wal['name']}] {ok} sent, stopped at #{i+1}: {str(e)[:60]}"
+                    return f"[{wal['name']}] {ok} sent, stopped at #{i+1}: {safe(e, 60)}"
                 if fail >= 3:
-                    return f"[{wal['name']}] {ok} sent, aborted after 3 errors: {str(e)[:50]}"
+                    return f"[{wal['name']}] {ok} sent, aborted after 3 errors: {safe(e, 50)}"
             if delay:
                 await asyncio.sleep(delay)
         return f"[{wal['name']}] {ok}/{count} sent" + (f", {fail} failed" if fail else "")
@@ -1559,19 +2069,125 @@ async def mintloop_cmd(update, context):
 
 
 @owner_only
+async def oscheck_cmd(update, context):
+    """Per-wallet eligibility across every phase (WL / FCFS / public) via OpenSea."""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /oscheck <opensea collection link or slug>\n"
+            "Logs each wallet into OpenSea (SIWE) and reports which phases it's eligible for.")
+        return
+    slug = os_slug(" ".join(context.args))
+    if not slug:
+        await update.effective_message.reply_text("Give an OpenSea collection link or slug.")
+        return
+    _w3 = w3()
+    try:
+        chain_id = await run_blocking(lambda: _w3.eth.chain_id)
+    except Exception:
+        chain_id = CHAIN_ID
+    await update.effective_message.reply_text(
+        f"Logging {len(STATE['wallets'])} wallets into OpenSea for '{slug}'...")
+
+    async def one(wal):
+        try:
+            s = await run_blocking(os_login, wal, slug, chain_id)
+            STATE["os_sessions"][wal["name"]] = s
+            stages, minted = await run_blocking(os_eligibility, s, slug, wal)
+            elig = [st for st in stages if st["eligible"]]
+            if not elig:
+                return f"[{wal['name']}] no eligible phase"
+            bits = []
+            for st in elig:
+                p = (Decimal(st["price_wei"]) / Decimal(10 ** 18)) if st["price_wei"] is not None else "?"
+                bits.append(f"{st['type']}(idx{st['index']}) max {st['max']} @ {p} ETH")
+            return f"[{wal['name']}] " + " | ".join(bits)
+        except Exception as e:
+            return f"[{wal['name']}] {safe(e, 70)}"
+
+    res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+    STATE["os_slug"] = slug
+    await update.effective_message.reply_text(
+        "\n".join([f"OpenSea eligibility - {slug}:"] + list(res) +
+                  ["", "Mint an eligible phase with: /osmint <STAGE_TYPE> [qty]",
+                   "e.g. /osmint SIGNED_PRESALE 1   |  /osmint PUBLIC_SALE 2"]))
+
+
+@owner_only
+async def osmint_cmd(update, context):
+    """Fetch per-wallet mint calldata from OpenSea (signature included for WL) and fire it."""
+    slug = STATE.get("os_slug")
+    if not slug:
+        await update.effective_message.reply_text("Run /oscheck <collection> first.")
+        return
+    stage_type = (context.args[0].upper() if context.args else "PUBLIC_SALE")
+    if stage_type not in STAGE_SELECTOR:
+        await update.effective_message.reply_text(
+            "Stage must be one of: SIGNED_PRESALE, MERKLE_PRESALE, PUBLIC_SALE")
+        return
+    qty = 1
+    if len(context.args) >= 2:
+        try:
+            qty = max(1, int(context.args[1]))
+        except ValueError:
+            pass
+    _w3 = w3()
+    try:
+        chain_id = await run_blocking(lambda: _w3.eth.chain_id)
+    except Exception:
+        chain_id = CHAIN_ID
+    try:
+        base = STATE["os_sessions"].get(STATE["wallets"][0]["name"])
+        if base is None:
+            base = await run_blocking(os_login, STATE["wallets"][0], slug, chain_id)
+            STATE["os_sessions"][STATE["wallets"][0]["name"]] = base
+        coll = await run_blocking(os_collection, base, slug)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Collection lookup failed: {safe(e, 100)}")
+        return
+    await update.effective_message.reply_text(
+        f"{slug} | {stage_type} | qty {qty}\nRequesting per-wallet calldata from OpenSea...")
+
+    async def one(wal):
+        try:
+            s = STATE["os_sessions"].get(wal["name"])
+            if s is None:
+                s = await run_blocking(os_login, wal, slug, chain_id)
+                STATE["os_sessions"][wal["name"]] = s
+            action = await run_blocking(os_mint_action, s, coll, wal, qty)
+            await run_blocking(os_validate, action, coll, wal, stage_type, qty, chain_id)
+            _pw3 = wallet_w3(wal)
+            tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
+                                    action["data"], action["value"])
+            raw = sign_wallet(_pw3, wal, tx)
+            txh = await run_blocking(do_send, _pw3, raw)
+            asyncio.create_task(_confirm(update, _pw3, txh, wal["name"]))
+            return f"[{wal['name']}] SENT {txh[:20]}.."
+        except Exception as e:
+            return f"[{wal['name']}] {safe(e, 70)}"
+
+    res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+    await update.effective_message.reply_text("\n".join([f"OS mint ({stage_type}):"] + list(res)))
+
+
+@owner_only
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
-    lines = [f"RPC pool: {n} endpoint(s) | {len(STATE['wallets'])} wallets spread across them"]
+    lines = [f"RPC pool: {n} endpoint(s), {len(healthy_endpoints())} healthy | "
+             f"{len(STATE['wallets'])} wallets | max spend {MAX_SPEND_ETH} ETH"]
 
     async def chk(i):
         url = RPC_POOL[i]
         host = url.split("/")[2] if "//" in url else url
-        wc = sum(1 for w in STATE["wallets"] if w.get("rpc_idx", 0) % n == i)
+        tag = url.rstrip("/").rsplit("/", 1)[-1][:6]
+        cool = _EP_COOL.get(url, 0) - time.time()
+        if cool > 0:
+            return f"[{i+1}] COOLING {int(cool)}s (rate limited) | ...{tag}"
         try:
-            bn = await run_blocking(lambda: pool_w3(i).eth.block_number)
-            return f"[{i+1}] OK block {bn} | {wc} wallet(s) | {host}"
+            bn = await run_blocking(lambda: w3_for(url).eth.block_number)
+            return f"[{i+1}] OK block {bn} | ...{tag}"
         except Exception as e:
-            return f"[{i+1}] DOWN {str(e)[:30]} | {wc} wallet(s) | {host}"
+            mark_rate_limited(url, 30) if is_rate_limit(e) else None
+            return f"[{i+1}] DOWN {safe(e, 40)} | ...{tag}"
 
     res = await asyncio.gather(*[chk(i) for i in range(n)])
     await update.effective_message.reply_text("\n".join(lines + list(res)))
@@ -1580,7 +2196,7 @@ async def rpcstatus_cmd(update, context):
 async def guard_msg(update, context):
     if not update.message or not update.message.text:
         return
-    if OWNER_ID and update.effective_user and update.effective_user.id != OWNER_ID:
+    if (not OWNER_ID) or (not update.effective_user) or update.effective_user.id != OWNER_ID:
         return
     text = update.message.text.strip()
     if PK_PATTERN.search(text):
@@ -1626,14 +2242,14 @@ def main():
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard_msg))
 
-    log.info("Bot up. owner=%s chain=%s wallets=%d rpc=%s submit=%s",
-             OWNER_ID, CHAIN_ID, len(STATE["wallets"]), RPC_URL, SUBMIT_RPC_URL)
+    log.info("Bot up. owner=%s chain=%s wallets=%d endpoints=%d",
+             OWNER_ID, CHAIN_ID, len(STATE["wallets"]), len(RPC_POOL))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

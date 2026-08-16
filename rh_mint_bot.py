@@ -1228,14 +1228,30 @@ async def mintall_cmd(update, context):
 
 
 def wallets_share_gate():
-    """True when all wallets would send the identical call - one probe covers them."""
+    """True when one probe answers 'is it open?' for every wallet.
+
+    Two cases qualify:
+      1. Identical calldata (plain mint(qty) style) - obviously shared.
+      2. SeaDrop, where calldata differs ONLY by the minter address baked in.
+         The stage open/closed state is still identical for all wallets, so one
+         probe is enough - and this is the common case, so it matters most.
+    Per-wallet whitelist calldata (proofs/signatures) does NOT qualify: those
+    wallets genuinely have different eligibility and must be probed separately.
+    """
     ws = STATE["wallets"]
     if len(ws) < 2:
         return False
+    if any(w.get("calldata") for w in ws):
+        return False                      # custom per-wallet calldata -> not shared
     try:
+        vals = {wallet_value(w) for w in ws}
+        if len(vals) != 1:
+            return False
+        if STATE.get("seadrop"):
+            return True                   # only the minter address differs
         _w3 = w3()
-        first = (wallet_calldata(_w3, ws[0]), wallet_value(ws[0]))
-        return all((wallet_calldata(_w3, w), wallet_value(w)) == first for w in ws[1:])
+        first = wallet_calldata(_w3, ws[0])
+        return all(wallet_calldata(_w3, w) == first for w in ws[1:])
     except Exception:
         return False
 
@@ -1682,6 +1698,72 @@ def is_signed_mint(data):
     return ("0x" + body[:8].lower()) == SIGNED_SELECTOR
 
 
+SELECTOR_NAME = {("0x" + Web3.keccak(text=s)[:4].hex().replace("0x", "").lower()): s
+                 for s in MINT_SIGS}
+STAGE_LABEL = {
+    "0x161ac21f": "PUBLIC phase",
+    "0x4b61cd6f": "WHITELIST phase (signature)",
+    "0x4300a4e6": "ALLOWLIST phase (merkle proof)",
+}
+
+
+def describe_mint(_w3, to, data, value, qty_hint=None):
+    """Work out what a watched wallet actually minted, for a readable alert."""
+    sel = ("0x" + (data[2:10] if data.startswith("0x") else data[:8])).lower()
+    is_sea = to.lower() == SEADROP_ADDR.lower()
+    collection = (calldata_collection(data) or to) if is_sea else to
+    info = {
+        "collection": collection,
+        "route": "OpenSea SeaDrop" if is_sea else "Direct contract",
+        "phase": STAGE_LABEL.get(sel, SELECTOR_NAME.get(sel, sel)),
+        "selector": sel,
+        "name": None,
+        "qty": qty_hint,
+        "price_wei": value,
+        "supply": None,
+        "max_wallet": None,
+    }
+    try:
+        info["name"] = read_name(_w3, collection)
+    except Exception:
+        pass
+    # quantity sits in word 3 for SeaDrop mints
+    if is_sea and qty_hint is None:
+        try:
+            body = data[2:] if data.startswith("0x") else data
+            info["qty"] = int(body[8 + 64 * 3: 8 + 64 * 4], 16)
+        except Exception:
+            pass
+    if is_sea:
+        try:
+            pd = read_public_drop(_w3, collection)
+            if pd:
+                info["max_wallet"] = int(pd[3])
+                if value == 0 and int(pd[0]) > 0:
+                    info["price_wei"] = None  # their stage was free, public may not be
+        except Exception:
+            pass
+    return info
+
+
+def format_mint(info):
+    lines = []
+    lines.append(f"Collection: {info['name']}" if info["name"] else "Collection: (unnamed)")
+    lines.append(f"Contract: {info['collection']}")
+    lines.append(f"Via: {info['route']} - {info['phase']}")
+    bits = []
+    if info.get("qty"):
+        bits.append(f"qty {info['qty']}")
+    if info.get("price_wei") is not None:
+        p = Decimal(info["price_wei"]) / Decimal(10 ** 18)
+        bits.append("FREE" if p == 0 else f"{p} ETH")
+    if info.get("max_wallet"):
+        bits.append(f"max {info['max_wallet']}/wallet")
+    if bits:
+        lines.append(" | ".join(bits))
+    return "\n".join(lines)
+
+
 def copy_wallet_calldata(to, data, wal):
     # if the target used OpenSea SeaDrop mintPublic, rebuild with OUR wallet as minter
     body = data[2:] if data.startswith("0x") else data
@@ -1807,11 +1889,16 @@ async def _copy_loop(context, chat_id, target, interval):
                         fee = OPENSEA_FEE_RECIPIENT
                     price = int(pd[0])
                     pub_price = Decimal(price) / Decimal(10 ** 18)
+                    try:
+                        _info = await run_blocking(describe_mint, _w3, to, data, val)
+                        _detail = format_mint(_info)
+                    except Exception:
+                        _detail = f"Contract: {coll}"
                     await context.bot.send_message(
                         chat_id,
-                        f"Copy: {copy_label(target)} minted a WL (signature) drop - that signature "
-                        f"is bound to their wallet, so it can't be copied.\n"
-                        f"But {coll[:10]}.. has a LIVE PUBLIC stage ({pub_price} ETH) - using that instead.")
+                        f"{copy_label(target)} minted the WHITELIST phase (can't copy their signature)\n\n"
+                        f"{_detail}\n\n"
+                        f"But the PUBLIC phase is LIVE ({pub_price} ETH) - using that for your wallets.")
                     STATE["seadrop_fee"] = fee
                     pub_data = seadrop_calldata(coll, STATE["wallets"][0]["address"], 1) if STATE["wallets"] else None
                     if pub_data:
@@ -1829,16 +1916,29 @@ async def _copy_loop(context, chat_id, target, interval):
                                 f"Public stage is PAID: {pub_price} ETH x {len(STATE['wallets'])} wallets "
                                 f"= {pub_price * len(STATE['wallets'])} ETH. Mint?", reply_markup=kb)
                 else:
+                    try:
+                        _info = await run_blocking(describe_mint, _w3, to, data, val)
+                        _detail = format_mint(_info)
+                    except Exception:
+                        _detail = f"Contract: {coll or to}"
                     await context.bot.send_message(
                         chat_id,
-                        f"Copy: {copy_label(target)} minted a WL (signature) drop at "
-                        f"{(coll or to)[:10]}.. - SKIPPED. The signature only works for their wallet, "
-                        f"and no public stage is live. Mint this one manually on OpenSea if you're allowlisted.")
+                        f"{copy_label(target)} minted a WHITELIST drop - can't auto-copy\n\n"
+                        f"{_detail}\n\n"
+                        f"Their signature only works for their wallet, and no public stage is live yet.\n"
+                        f"-> /oscheck to see if YOUR wallets are allowlisted\n"
+                        f"-> or paste {(coll or to)} to watch for the public phase")
                 continue
 
             if val == 0:
+                try:
+                    _info = await run_blocking(describe_mint, _w3, to, data, val)
+                    _detail = format_mint(_info)
+                except Exception:
+                    _detail = f"Contract: {to}"
                 await context.bot.send_message(
-                    chat_id, f"Copy: {copy_label(target)} FREE-minted {to[:10]}.. -> firing all wallets")
+                    chat_id,
+                    f"{copy_label(target)} minted (FREE) - copying to all wallets\n\n{_detail}")
                 asyncio.create_task(copy_fire(context, chat_id, to, data, val))
             else:
                 pid = str(STATE["pending_seq"])
@@ -1849,12 +1949,16 @@ async def _copy_loop(context, chat_id, target, interval):
                     InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
                     InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}"),
                 ]])
+                try:
+                    _info = await run_blocking(describe_mint, _w3, to, data, val)
+                    _detail = format_mint(_info)
+                except Exception:
+                    _detail = f"Contract: {to}"
                 await context.bot.send_message(
                     chat_id,
-                    f"Copy: {copy_label(target)} minted a PAID drop\n"
-                    f"Price {price} ETH x {len(STATE['wallets'])} wallets "
-                    f"= {price * len(STATE['wallets'])} ETH total\n"
-                    f"Contract {to}\n"
+                    f"{copy_label(target)} minted a PAID drop\n\n{_detail}\n\n"
+                    f"Your cost: {price} ETH x {len(STATE['wallets'])} wallets "
+                    f"= {price * len(STATE['wallets'])} ETH\n"
                     f"Mint from your wallets?",
                     reply_markup=kb,
                 )

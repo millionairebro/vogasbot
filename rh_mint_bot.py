@@ -210,10 +210,6 @@ STATE = {
 _SUBMIT = None
 
 
-def w3():
-    return Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 10}))
-
-
 def submit_w3():
     global _SUBMIT
     if _SUBMIT is None:
@@ -260,6 +256,18 @@ def wallet_rpc(wal):
 
 def wallet_w3(wal):
     return wallet_rpc(wal)[0]
+
+
+_RR = {"i": 0}
+
+
+def w3():
+    """General-purpose client. Round-robins over HEALTHY pool endpoints so no single
+    key gets hammered (this used to pin every call to RPC_URL)."""
+    hs = healthy_endpoints()
+    _RR["i"] = (_RR["i"] + 1) % len(hs)
+    return w3_for(hs[_RR["i"]])
+
 
 
 # ---- speed layer -------------------------------------------------------
@@ -606,6 +614,23 @@ def _fmt_eta(target):
 OS_SITE = "https://opensea.io"
 OS_GQL = "https://gql.opensea.io/graphql"
 OS_APP_ID = "os2-web"
+# OpenSea throttles bursts from one IP - keep concurrency low and space requests out.
+OS_CONCURRENCY = int(os.environ.get("OS_CONCURRENCY", "2") or "2")
+OS_DELAY = float(os.environ.get("OS_DELAY", "1.2") or "1.2")
+OS_RETRIES = int(os.environ.get("OS_RETRIES", "6") or "6")
+_OS_SEM = None
+
+
+def os_sem():
+    global _OS_SEM
+    if _OS_SEM is None:
+        _OS_SEM = asyncio.Semaphore(max(1, OS_CONCURRENCY))
+    return _OS_SEM
+
+
+def is_os_rate_limited(err):
+    s = str(err).lower()
+    return "429" in s or "too many request" in s
 OS_SIWE_STATEMENT = (
     "Click to sign in and accept the OpenSea Terms of Service "
     "(https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy)."
@@ -665,6 +690,25 @@ query MintActionTimelineQuery($address: Address!, $fromAssets: [AssetQuantityInp
   }
 }
 """
+
+
+async def os_retry(fn, *args, label=""):
+    """Run an OpenSea call under the concurrency limit, backing off on 429."""
+    delay = 1.5
+    last = None
+    for attempt in range(OS_RETRIES):
+        async with os_sem():
+            try:
+                res = await run_blocking(fn, *args)
+                await asyncio.sleep(OS_DELAY)      # space out the next one
+                return res
+            except Exception as e:
+                last = e
+                if not is_os_rate_limited(e):
+                    raise
+        await asyncio.sleep(delay)                 # released the slot while waiting
+        delay = min(delay * 2, 45.0)
+    raise last if last else RuntimeError("OpenSea retry failed")
 
 
 def os_slug(text):
@@ -897,6 +941,7 @@ async def help_cmd(update, context):
         "/cancel - stop EVERYTHING\n"
         "/oscheck <collection> - OpenSea WL/FCFS/public eligibility per wallet\n"
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
+        "/oslogout - clear OpenSea sessions (if they go stale)\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
         "/copy 0xADDR [name] - track a wallet (named alerts)\n"
         "/rename 0xADDR <name> - rename a tracked wallet\n"
@@ -908,15 +953,17 @@ async def help_cmd(update, context):
 
 @owner_only
 async def wallets_cmd(update, context):
-    _w3 = w3()
     lines = [f"{len(STATE['wallets'])} wallet(s):"]
     for wal in STATE["wallets"]:
         tag = "proof-set" if wal["calldata"] else "auto"
+        _w3, _url = wallet_rpc(wal)      # spread balance checks across the pool
         try:
             bal = _w3.eth.get_balance(wal["address"])
             lines.append(f"[{wal['name']}] {wal['address'][:8]}..{wal['address'][-4:]}  "
                          f"{Decimal(bal)/Decimal(10**18):.5f} ETH  qty {wal['qty']}  {tag}")
-        except Exception:
+        except Exception as e:
+            if is_rate_limit(e):
+                mark_rate_limited(_url)
             lines.append(f"[{wal['name']}] {wal['address'][:8]}..  RPC err  {tag}")
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -2189,14 +2236,19 @@ async def oscheck_cmd(update, context):
         chain_id = await run_blocking(lambda: _w3.eth.chain_id)
     except Exception:
         chain_id = CHAIN_ID
+    todo = [w for w in STATE["wallets"] if w["name"] not in STATE["os_sessions"]]
+    est = int(len(todo) * OS_DELAY / max(1, OS_CONCURRENCY)) + 3
     await update.effective_message.reply_text(
-        f"Logging {len(STATE['wallets'])} wallets into OpenSea for '{slug}'...")
+        f"Checking {len(STATE['wallets'])} wallets on OpenSea "
+        f"({len(todo)} need login, ~{est}s - throttled to avoid rate limits)...")
 
     async def one(wal):
         try:
-            s = await run_blocking(os_login, wal, slug, chain_id)
-            STATE["os_sessions"][wal["name"]] = s
-            stages, minted = await run_blocking(os_eligibility, s, slug, wal)
+            s = STATE["os_sessions"].get(wal["name"])
+            if s is None:
+                s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
+                STATE["os_sessions"][wal["name"]] = s
+            stages, minted = await os_retry(os_eligibility, s, slug, wal, label=wal["name"])
             elig = [st for st in stages if st["eligible"]]
             if not elig:
                 return f"[{wal['name']}] no eligible phase"
@@ -2206,6 +2258,8 @@ async def oscheck_cmd(update, context):
                 bits.append(f"{st['type']}(idx{st['index']}) max {st['max']} @ {p} ETH")
             return f"[{wal['name']}] " + " | ".join(bits)
         except Exception as e:
+            if is_os_rate_limited(e):
+                return f"[{wal['name']}] rate limited by OpenSea - re-run /oscheck"
             return f"[{wal['name']}] {safe(e, 70)}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
@@ -2255,9 +2309,9 @@ async def osmint_cmd(update, context):
         try:
             s = STATE["os_sessions"].get(wal["name"])
             if s is None:
-                s = await run_blocking(os_login, wal, slug, chain_id)
+                s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
                 STATE["os_sessions"][wal["name"]] = s
-            action = await run_blocking(os_mint_action, s, coll, wal, qty)
+            action = await os_retry(os_mint_action, s, coll, wal, qty, label=wal["name"])
             await run_blocking(os_validate, action, coll, wal, stage_type, qty, chain_id)
             _pw3 = wallet_w3(wal)
             tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
@@ -2267,10 +2321,21 @@ async def osmint_cmd(update, context):
             asyncio.create_task(_confirm(update, _pw3, txh, wal["name"]))
             return f"[{wal['name']}] SENT {txh[:20]}.."
         except Exception as e:
+            if is_os_rate_limited(e):
+                return f"[{wal['name']}] OpenSea rate limited - retry /osmint"
             return f"[{wal['name']}] {safe(e, 70)}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
     await update.effective_message.reply_text("\n".join([f"OS mint ({stage_type}):"] + list(res)))
+
+
+@owner_only
+async def oslogout_cmd(update, context):
+    n = len(STATE["os_sessions"])
+    STATE["os_sessions"] = {}
+    STATE["os_slug"] = None
+    await update.effective_message.reply_text(
+        f"Cleared {n} OpenSea session(s). Run /oscheck to log in again.")
 
 
 @owner_only
@@ -2346,7 +2411,7 @@ def main():
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

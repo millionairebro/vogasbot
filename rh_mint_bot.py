@@ -199,6 +199,8 @@ STATE = {
     "copy_labels":  {},
     "os_sessions":  {},
     "os_slug":      None,
+    "os_ctx":       None,
+    "os_qty":       None,
     "awaiting_copy": False,
     "seadrop":      False,
     "seadrop_collection": None,
@@ -942,6 +944,7 @@ async def help_cmd(update, context):
         "/oscheck <collection> - OpenSea WL/FCFS/public eligibility per wallet\n"
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
         "/oslogout - clear OpenSea sessions (if they go stale)\n"
+        "/osqty <n> - per-wallet qty for OpenSea mints (default: stage max)\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
         "/copy 0xADDR [name] - track a wallet (named alerts)\n"
         "/rename 0xADDR <name> - rename a tracked wallet\n"
@@ -1087,7 +1090,13 @@ async def source_cmd(update, context):
         await update.effective_message.reply_text(
             "Usage: /source <opensea link or 0xcontract> - or just paste the address, no command needed.")
         return
-    await do_source(update, context, " ".join(context.args))
+    _txt = " ".join(context.args)
+    if "opensea.io/collection/" in _txt:
+        _s = os_slug(_txt)
+        if _s:
+            await os_autoload(update, context, _s)
+            return
+    await do_source(update, context, _txt)
 
 
 @owner_only
@@ -2052,6 +2061,24 @@ async def cb_handler(update, context):
         elif a == "auto":
             await autoall_cmd(update, context)
         return
+    if parts[0] == "osx":
+        act, stage = parts[1], parts[2]
+        if act == "r":
+            ctx = STATE.get("os_ctx")
+            if ctx:
+                STATE["os_sessions"] = {}
+                await os_autoload(update, context, ctx["slug"])
+            return
+        if act == "m":
+            await os_fire_stage(context, q.message.chat_id, stage)
+            return
+        if act == "a":
+            old = STATE["auto_tasks"].get("_os")
+            if old and not old.done():
+                old.cancel()
+            STATE["auto_tasks"]["_os"] = asyncio.create_task(
+                os_auto_stage(context, q.message.chat_id, stage))
+            return
     if parts[0] == "cw":
         if len(parts) == 2 and parts[1] == "add":
             STATE["awaiting_copy"] = True
@@ -2219,6 +2246,251 @@ async def mintloop_cmd(update, context):
     await update.effective_message.reply_text("\n".join(["Mint loop done:"] + out))
 
 
+
+def os_parse_time(v):
+    """Stage times come back as epoch seconds or ISO8601. Return epoch float or None."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if re.fullmatch(r"\d{10}", s):
+        return float(s)
+    if re.fullmatch(r"\d{13}", s):
+        return float(s) / 1000.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def os_stage_label(t):
+    return {"SIGNED_PRESALE": "WHITELIST", "MERKLE_PRESALE": "ALLOWLIST",
+            "PUBLIC_SALE": "PUBLIC"}.get(t, t)
+
+
+def os_ctx_buttons():
+    """One row per phase: MINT NOW + AUTO (fires at the phase's start time)."""
+    ctx = STATE.get("os_ctx") or {}
+    rows = []
+    for t in ctx.get("order", []):
+        n = len(ctx["elig"].get(t, []))
+        if not n:
+            continue
+        lbl = os_stage_label(t)
+        rows.append([
+            InlineKeyboardButton(f"MINT {lbl} NOW ({n})", callback_data=f"osx|m|{t}"),
+            InlineKeyboardButton(f"AUTO {lbl}", callback_data=f"osx|a|{t}"),
+        ])
+    rows.append([InlineKeyboardButton("Refresh eligibility", callback_data="osx|r|-")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def os_autoload(update, context, slug):
+    """Paste an OpenSea link -> log in, read stages + per-wallet eligibility, show buttons."""
+    reply = update.effective_message.reply_text
+    _w3 = w3()
+    try:
+        chain_id = await run_blocking(lambda: _w3.eth.chain_id)
+    except Exception:
+        chain_id = CHAIN_ID
+    ws = STATE["wallets"]
+    todo = [w for w in ws if w["name"] not in STATE["os_sessions"]]
+    est = int(len(todo) * OS_DELAY / max(1, OS_CONCURRENCY)) + 3
+    msg = await reply(f"Loading {slug} - checking {len(ws)} wallets"
+                      + (f" (~{est}s)" if todo else " (cached)") + "...")
+
+    # sessions first (needed for every later call)
+    async def login(w):
+        try:
+            if w["name"] not in STATE["os_sessions"]:
+                STATE["os_sessions"][w["name"]] = await os_retry(
+                    os_login, w, slug, chain_id, label=w["name"])
+            return None
+        except Exception as e:
+            return f"{w['name']}: {safe(e, 40)}"
+
+    login_errs = [e for e in await asyncio.gather(*[login(w) for w in ws]) if e]
+    live = [w for w in ws if w["name"] in STATE["os_sessions"]]
+    if not live:
+        await reply("Couldn't log any wallet into OpenSea. Try again in a minute (/oslogout to reset).")
+        return
+
+    try:
+        coll = await os_retry(os_collection, STATE["os_sessions"][live[0]["name"]], slug)
+    except Exception as e:
+        await reply(f"Collection lookup failed: {safe(e, 90)}")
+        return
+
+    stage_meta = {}
+    for st in coll.get("stages") or []:
+        t = st.get("stageType")
+        if not t:
+            continue
+        stage_meta[t] = {
+            "start": os_parse_time(st.get("startTime")),
+            "end": os_parse_time(st.get("endTime")),
+            "index": st.get("stageIndex"),
+        }
+
+    async def elig(w):
+        try:
+            stages, _ = await os_retry(os_eligibility, STATE["os_sessions"][w["name"]], slug, w,
+                                       label=w["name"])
+            return w["name"], [s for s in stages if s["eligible"]], None
+        except Exception as e:
+            return w["name"], [], safe(e, 40)
+
+    results = await asyncio.gather(*[elig(w) for w in live])
+    elig_map, price_map, max_map, errs = {}, {}, {}, []
+    for name, stages, err in results:
+        if err:
+            errs.append(f"{name}: {err}")
+        for s in stages:
+            t = s["type"]
+            elig_map.setdefault(t, []).append(name)
+            if s.get("price_wei") is not None:
+                price_map[t] = s["price_wei"]
+            if s.get("max"):
+                max_map[t] = max(int(s["max"] or 0), max_map.get(t, 0))
+
+    order = [t for t in ("SIGNED_PRESALE", "MERKLE_PRESALE", "PUBLIC_SALE") if t in elig_map]
+    order += [t for t in elig_map if t not in order]
+    STATE["os_ctx"] = {"slug": slug, "coll": coll, "elig": elig_map, "price": price_map,
+                       "max": max_map, "meta": stage_meta, "order": order, "chain_id": chain_id}
+
+    lines = [f"{coll.get('name') or slug}", f"Contract: {coll['address']}",
+             f"Wallets checked: {len(live)}/{len(ws)}"]
+    if not order:
+        lines.append("\nNo eligible phase for any wallet right now.")
+    now = time.time()
+    for t in order:
+        p = price_map.get(t)
+        pe = "?" if p is None else ("FREE" if p == 0 else f"{Decimal(p)/Decimal(10**18)} ETH")
+        m = stage_meta.get(t, {})
+        when = ""
+        if m.get("start"):
+            if m["start"] > now:
+                when = f" | opens in {_fmt_eta(m['start'])}"
+            elif m.get("end") and m["end"] < now:
+                when = " | ENDED"
+            else:
+                when = " | LIVE NOW"
+        lines.append(f"\n{os_stage_label(t)}: {len(elig_map[t])} wallets eligible | "
+                     f"max {max_map.get(t, '?')}/wallet | {pe}{when}")
+    if errs or login_errs:
+        bad = (login_errs + errs)[:3]
+        lines.append(f"\n({len(login_errs)+len(errs)} wallet(s) errored - tap Refresh: {bad[0]})")
+    await reply("\n".join(lines), reply_markup=os_ctx_buttons())
+
+
+async def os_fire_stage(context, chat_id, stage_type, qty=None):
+    """Fetch each eligible wallet's own calldata from OpenSea, validate, and blast it."""
+    ctx = STATE.get("os_ctx")
+    if not ctx:
+        await context.bot.send_message(chat_id, "Load a collection first (paste the OpenSea link).")
+        return
+    names = ctx["elig"].get(stage_type) or []
+    wallets = [w for w in STATE["wallets"] if w["name"] in names]
+    if not wallets:
+        await context.bot.send_message(chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
+        return
+    per = qty or STATE.get("os_qty") or ctx["max"].get(stage_type) or 1
+    per = max(1, int(per))
+    price = ctx["price"].get(stage_type) or 0
+    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
+    if total > MAX_SPEND_ETH:
+        await context.bot.send_message(
+            chat_id, f"SPEND GUARD: {total} ETH needed, limit is {MAX_SPEND_ETH}. "
+                     f"Raise RH_MAX_SPEND_ETH or lower qty with /osqty.")
+        return
+    await context.bot.send_message(
+        chat_id, f"FIRING {os_stage_label(stage_type)} - {len(wallets)} wallets x{per} "
+                 f"({total} ETH total)")
+    coll, chain_id = ctx["coll"], ctx["chain_id"]
+
+    async def one(wal):
+        try:
+            s = STATE["os_sessions"].get(wal["name"])
+            if s is None:
+                s = await os_retry(os_login, wal, ctx["slug"], chain_id, label=wal["name"])
+                STATE["os_sessions"][wal["name"]] = s
+            action = None
+            last = None
+            for _ in range(6):                    # phase may flip live a beat late
+                try:
+                    action = await os_retry(os_mint_action, s, coll, wal, per, label=wal["name"])
+                    break
+                except Exception as e:
+                    last = e
+                    if is_os_rate_limited(e):
+                        raise
+                    await asyncio.sleep(0.5)
+            if action is None:
+                raise last or RuntimeError("no mint action")
+            await run_blocking(os_validate, action, coll, wal, stage_type, per, chain_id)
+            _pw3, _ = wallet_rpc(wal)
+            tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
+                                    action["data"], action["value"])
+            raw = sign_wallet(_pw3, wal, tx)
+            txh = await run_blocking(do_send, _pw3, raw)
+            await context.bot.send_message(chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
+            asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, wal["name"]))
+            return None
+        except Exception as e:
+            return f"{wal['name']}: {safe(e, 60)}"
+
+    fails = [f for f in await asyncio.gather(*[one(w) for w in wallets]) if f]
+    if fails:
+        await context.bot.send_message(
+            chat_id, f"{len(fails)}/{len(wallets)} failed:\n" + "\n".join(fails[:6]))
+    else:
+        await context.bot.send_message(chat_id, f"All {len(wallets)} wallets fired.")
+
+
+async def os_auto_stage(context, chat_id, stage_type, qty=None):
+    """Sleep until the phase's start time (ZERO rpc while waiting), then fire everything."""
+    ctx = STATE.get("os_ctx")
+    if not ctx:
+        return
+    meta = ctx["meta"].get(stage_type) or {}
+    start = meta.get("start")
+    now = time.time()
+    if start and start > now:
+        await context.bot.send_message(
+            chat_id,
+            f"AUTO-MINT armed for {os_stage_label(stage_type)}\n"
+            f"Opens in {_fmt_eta(start)} "
+            f"({datetime.fromtimestamp(start, tz=timezone.utc):%H:%M:%S UTC})\n"
+            f"Sleeping until then - no RPC used while waiting. /cancelauto to stop.")
+        while True:
+            left = start - time.time()
+            if left <= 1.0:
+                break
+            await asyncio.sleep(min(left - 0.5, 20))
+        await asyncio.sleep(max(0.0, start - time.time()))
+    else:
+        await context.bot.send_message(
+            chat_id, f"{os_stage_label(stage_type)} looks live - firing now.")
+    await os_fire_stage(context, chat_id, stage_type, qty)
+    STATE["auto_tasks"].pop("_os", None)
+
+
+@owner_only
+async def osqty_cmd(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            f"Usage: /osqty <n>  (per wallet; currently "
+            f"{STATE.get('os_qty') or 'auto = stage max'})")
+        return
+    try:
+        STATE["os_qty"] = max(1, int(context.args[0]))
+    except ValueError:
+        await update.effective_message.reply_text("bad number")
+        return
+    await update.effective_message.reply_text(f"OpenSea mint qty per wallet: {STATE['os_qty']}")
+
+
 @owner_only
 async def oscheck_cmd(update, context):
     """Per-wallet eligibility across every phase (WL / FCFS / public) via OpenSea."""
@@ -2381,6 +2653,12 @@ async def guard_msg(update, context):
         STATE["awaiting_copy"] = False
         await add_copy_target(context, update.effective_chat.id, Web3.to_checksum_address(m.group(0)))
         return
+    _s = None
+    if "opensea.io/collection/" in text:
+        _s = os_slug(text)
+    if _s:
+        await os_autoload(update, context, _s)
+        return
     if re.search(r"0x[a-fA-F0-9]{40}", text) or "opensea.io" in text:
         await do_source(update, context, text)
         return
@@ -2411,7 +2689,7 @@ def main():
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

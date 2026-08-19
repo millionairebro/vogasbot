@@ -945,6 +945,8 @@ async def help_cmd(update, context):
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
         "/oslogout - clear OpenSea sessions (if they go stale)\n"
         "/osqty <n> - per-wallet qty for OpenSea mints (default: stage max)\n"
+        "/proofapi <url> - fetch merkle proofs for all wallets from a site API\n"
+        "/setproof <wallet> 0x.. - set one wallet calldata manually\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
         "/copy 0xADDR [name] - track a wallet (named alerts)\n"
         "/rename 0xADDR <name> - rename a tracked wallet\n"
@@ -2384,14 +2386,14 @@ async def os_autoload(update, context, slug):
     await reply("\n".join(lines), reply_markup=os_ctx_buttons())
 
 
-async def os_fire_stage(context, chat_id, stage_type, qty=None):
+async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
     """Fetch each eligible wallet's own calldata from OpenSea, validate, and blast it."""
     ctx = STATE.get("os_ctx")
     if not ctx:
         await context.bot.send_message(chat_id, "Load a collection first (paste the OpenSea link).")
         return
     names = ctx["elig"].get(stage_type) or []
-    wallets = [w for w in STATE["wallets"] if w["name"] in names]
+    wallets = only if only else [w for w in STATE["wallets"] if w["name"] in names]
     if not wallets:
         await context.bot.send_message(chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
         return
@@ -2436,6 +2438,7 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None):
             txh = await run_blocking(do_send, _pw3, raw)
             await context.bot.send_message(chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, wal["name"]))
+            STATE.setdefault("os_done", {})[wal["name"]] = True
             return None
         except Exception as e:
             return f"{wal['name']}: {safe(e, 60)}"
@@ -2448,31 +2451,121 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None):
         await context.bot.send_message(chat_id, f"All {len(wallets)} wallets fired.")
 
 
+async def os_prearm(context, chat_id, stage_type, per, wallets, coll, chain_id, slug):
+    """Try to get each wallet's signed calldata BEFORE the phase opens, and pre-sign the
+    tx. At T+0 we then only broadcast - no API round trip in the critical path.
+    OpenSea often issues the signature early because validity is enforced on-chain."""
+    armed = {}
+
+    async def one(wal):
+        try:
+            s = STATE["os_sessions"].get(wal["name"])
+            if s is None:
+                s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
+                STATE["os_sessions"][wal["name"]] = s
+            action = await os_retry(os_mint_action, s, coll, wal, per, label=wal["name"])
+            await run_blocking(os_validate, action, coll, wal, stage_type, per, chain_id)
+            _pw3, _ = wallet_rpc(wal)
+            tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
+                                    action["data"], action["value"])
+            armed[wal["name"]] = (sign_wallet(_pw3, wal, tx), _pw3)
+            return None
+        except Exception as e:
+            return f"{wal['name']}: {safe(e, 40)}"
+
+    errs = [e for e in await asyncio.gather(*[one(w) for w in wallets]) if e]
+    return armed, errs
+
+
+async def os_blast_armed(context, chat_id, armed):
+    """Broadcast every pre-signed tx at once - this is the zero-latency path."""
+    async def fire(name, pair):
+        raw, _pw3 = pair
+        try:
+            txh = await run_blocking(do_send, _pw3, raw)
+            await context.bot.send_message(chat_id, f"[{name}] SENT {txh}\n{EXPLORER}/tx/{txh}")
+            asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, name))
+            return None
+        except Exception as e:
+            return f"{name}: {safe(e, 60)}"
+    return [f for f in await asyncio.gather(*[fire(n, p) for n, p in armed.items()]) if f]
+
+
 async def os_auto_stage(context, chat_id, stage_type, qty=None):
-    """Sleep until the phase's start time (ZERO rpc while waiting), then fire everything."""
+    """Sleep until the phase opens (zero RPC), PRE-ARM shortly before, then blast at T+0."""
     ctx = STATE.get("os_ctx")
     if not ctx:
         return
     meta = ctx["meta"].get(stage_type) or {}
     start = meta.get("start")
-    now = time.time()
-    if start and start > now:
+    names = ctx["elig"].get(stage_type) or []
+    wallets = only if only else [w for w in STATE["wallets"] if w["name"] in names]
+    if not wallets:
+        await context.bot.send_message(chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
+        return
+    per = qty or STATE.get("os_qty") or ctx["max"].get(stage_type) or 1
+    per = max(1, int(per))
+    price = ctx["price"].get(stage_type) or 0
+    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
+    if total > MAX_SPEND_ETH:
+        await context.bot.send_message(
+            chat_id, f"SPEND GUARD: {total} ETH needed, limit {MAX_SPEND_ETH}.")
+        return
+    lead = float(os.environ.get("OS_PREARM_LEAD", "25") or "25")
+
+    if start and start > time.time():
         await context.bot.send_message(
             chat_id,
             f"AUTO-MINT armed for {os_stage_label(stage_type)}\n"
-            f"Opens in {_fmt_eta(start)} "
-            f"({datetime.fromtimestamp(start, tz=timezone.utc):%H:%M:%S UTC})\n"
-            f"Sleeping until then - no RPC used while waiting. /cancelauto to stop.")
+            f"Opens in {_fmt_eta(start)} ({datetime.fromtimestamp(start, tz=timezone.utc):%H:%M:%S UTC})\n"
+            f"Will pre-fetch signatures {int(lead)}s early, then broadcast at T+0.\n"
+            f"Sleeping - no RPC used. /cancelauto to stop.")
+        while True:
+            left = start - time.time() - lead
+            if left <= 0:
+                break
+            await asyncio.sleep(min(left, 20))
+
+    # --- pre-arm attempt (the fix: get signatures BEFORE the gun) ---
+    armed, errs = {}, []
+    if start and start > time.time():
+        armed, errs = await os_prearm(context, chat_id, stage_type, per, wallets,
+                                      ctx["coll"], ctx["chain_id"], ctx["slug"])
+        if armed:
+            await context.bot.send_message(
+                chat_id, f"PRE-ARMED {len(armed)}/{len(wallets)} wallets - "
+                         f"broadcasting the instant it opens ({_fmt_eta(start)}).")
+        else:
+            await context.bot.send_message(
+                chat_id, "OpenSea won't sign before open - will fetch+fire at T+0."
+                         + (f" ({errs[0]})" if errs else ""))
+        # wait out the remaining time to the exact open
         while True:
             left = start - time.time()
-            if left <= 1.0:
+            if left <= 0.05:
                 break
-            await asyncio.sleep(min(left - 0.5, 20))
-        await asyncio.sleep(max(0.0, start - time.time()))
+            await asyncio.sleep(min(left, 0.5) if left < 2 else min(left - 1, 10))
+
+    if armed:
+        fails = await os_blast_armed(context, chat_id, armed)
+        missing = [w for w in wallets if w["name"] not in armed]
+        if fails:
+            await context.bot.send_message(chat_id, f"{len(fails)} broadcast failed:\n"
+                                                    + "\n".join(fails[:5]))
+        if missing:
+            await os_fire_stage(context, chat_id, stage_type, per, only=missing)
     else:
-        await context.bot.send_message(
-            chat_id, f"{os_stage_label(stage_type)} looks live - firing now.")
-    await os_fire_stage(context, chat_id, stage_type, qty)
+        await os_fire_stage(context, chat_id, stage_type, per)
+
+    # --- supply can free up from failed txs in the first seconds: keep trying briefly ---
+    retry_s = float(os.environ.get("OS_RETRY_WINDOW", "8") or "8")
+    if retry_s > 0:
+        deadline = time.time() + retry_s
+        while time.time() < deadline:
+            await asyncio.sleep(1.0)
+            left = [w for w in wallets if not STATE.get("os_done", {}).get(w["name"])]
+            if not left:
+                break
     STATE["auto_tasks"].pop("_os", None)
 
 
@@ -2610,6 +2703,140 @@ async def oslogout_cmd(update, context):
         f"Cleared {n} OpenSea session(s). Run /oscheck to log in again.")
 
 
+
+# ---------------------------------------------------------------------
+# Merkle-proof mints: pull each wallet's own proof from the project's API
+# and build its calldata. Works for any site that serves proofs by address.
+# ---------------------------------------------------------------------
+def _find_proof(obj):
+    """Recursively locate a list of 32-byte hex strings (the merkle proof)."""
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, str) and re.fullmatch(r"0x[0-9a-fA-F]{64}", x.strip())
+                       for x in obj):
+            return [x.strip() for x in obj]
+        for it in obj:
+            r = _find_proof(it)
+            if r:
+                return r
+    elif isinstance(obj, dict):
+        for k in ("proof", "proofs", "merkleProof", "merkle_proof", "hexProof"):
+            if k in obj:
+                r = _find_proof(obj[k])
+                if r:
+                    return r
+        for v in obj.values():
+            r = _find_proof(v)
+            if r:
+                return r
+    return None
+
+
+def _find_amount(obj):
+    """Locate the per-wallet allowance (second arg of the mint call)."""
+    keys = ("maxallowed", "max", "amount", "allowance", "limit", "quantity", "qty",
+            "maxmint", "maxamount", "allocation", "tier")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower().replace("_", "") in keys:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+        for v in obj.values():
+            r = _find_amount(v)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for it in obj:
+            r = _find_amount(it)
+            if r is not None:
+                return r
+    return None
+
+
+def fetch_proof(url_tpl, address):
+    import requests
+    url = url_tpl.replace("{address}", address).replace("{ADDRESS}", address) \
+                 .replace("{addr}", address).replace("{wallet}", address)
+    if "{" not in url_tpl:
+        url = url_tpl.rstrip("/") + "/" + address
+    r = requests.get(url, timeout=15, headers={
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
+    if r.status_code == 404:
+        raise RuntimeError("not on allowlist (404)")
+    r.raise_for_status()
+    j = r.json()
+    proof = _find_proof(j)
+    if not proof:
+        raise RuntimeError("no proof in response")
+    return proof, _find_amount(j)
+
+
+def build_proof_calldata(selector, qty, max_allowed, proof):
+    sel = selector if selector.startswith("0x") else "0x" + selector
+    enc = abi_encode(["uint256", "uint256", "bytes32[]"],
+                     [int(qty), int(max_allowed),
+                      [bytes.fromhex(p[2:]) for p in proof]]).hex()
+    return sel + enc
+
+
+@owner_only
+async def proofapi_cmd(update, context):
+    """/proofapi <url with {address}> [selector] [qty] - pull every wallet's proof and arm it."""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /proofapi <url> [selector] [qty]\n\n"
+            "Put {address} where the wallet goes, e.g.\n"
+            "/proofapi https://site.com/api/proof?address={address}\n\n"
+            "Find it: open the mint site, DevTools > Network, connect a wallet - "
+            "look for the request that returns a list of 0x... hashes.\n"
+            "Default selector 0xda39f8cf mint(qty,maxAllowed,proof[]).")
+        return
+    url_tpl = context.args[0]
+    selector = context.args[1] if len(context.args) > 1 else "0xda39f8cf"
+    qty = int(context.args[2]) if len(context.args) > 2 else 1
+    await update.effective_message.reply_text(
+        f"Fetching proofs for {len(STATE['wallets'])} wallets...")
+
+    async def one(wal):
+        try:
+            proof, amt = await run_blocking(fetch_proof, url_tpl, wal["address"])
+            max_allowed = amt if amt is not None else qty
+            wal["calldata"] = build_proof_calldata(selector, qty, max_allowed, proof)
+            wal["armed"] = None
+            return f"[{wal['name']}] OK proof({len(proof)}) max {max_allowed}"
+        except Exception as e:
+            wal["calldata"] = ""
+            return f"[{wal['name']}] {safe(e, 50)}"
+
+    res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+    ok = sum(1 for w in STATE["wallets"] if w["calldata"])
+    await update.effective_message.reply_text(
+        "\n".join(list(res) + ["", f"{ok}/{len(STATE['wallets'])} wallets armed with proofs.",
+                               "Now: /source <contract> -> /simall -> /armall -> Auto-mint"]))
+
+
+@owner_only
+async def setproof_cmd(update, context):
+    """Manually set one wallet's calldata: /setproof w3 0x...."""
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("Usage: /setproof <walletName> 0x<calldata>")
+        return
+    name, cd = context.args[0], context.args[1].strip()
+    if not cd.startswith("0x"):
+        cd = "0x" + cd
+    for wal in STATE["wallets"]:
+        if wal["name"].lower() == name.lower():
+            wal["calldata"] = cd
+            wal["armed"] = None
+            await update.effective_message.reply_text(
+                f"[{wal['name']}] calldata set ({len(cd[2:])//2} bytes).")
+            return
+    await update.effective_message.reply_text(f"No wallet named {name}. /wallets to list.")
+
+
 @owner_only
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
@@ -2689,7 +2916,7 @@ def main():
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("setproof", setproof_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))

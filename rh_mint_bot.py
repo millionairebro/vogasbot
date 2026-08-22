@@ -55,6 +55,79 @@ SUBMIT_RPC_URL = (os.environ.get("RH_SUBMIT_RPC_URL", "").strip() or RPC_URL)
 _pool_raw = os.environ.get("RH_RPC_POOL", "").strip()
 RPC_POOL = [u.strip() for u in re.split(r"[,\s]+", _pool_raw) if u.strip()] or [RPC_URL]
 RPC_POOL_RAW = list(RPC_POOL) + [RPC_URL, SUBMIT_RPC_URL]
+
+# ---------------- multichain -------------------------------------------
+def _pool(env, fallback=""):
+    raw = os.environ.get(env, "").strip() or fallback
+    return [u.strip() for u in re.split(r"[,\s]+", raw) if u.strip()]
+
+
+ETH_POOL = _pool("ETH_RPC_POOL")
+ETH_WATCH = os.environ.get("ETH_WATCH_RPC", "").strip()
+RH_WATCH = os.environ.get("RH_WATCH_RPC", "").strip()
+
+CHAINS = {
+    "rh": {
+        "name": "Robinhood Chain", "chain_id": 4663, "os_chain": "robinhood",
+        "pool": RPC_POOL, "watch": RH_WATCH,
+        "explorer": os.environ.get("RH_EXPLORER", "https://robinhoodchain.blockscout.com").rstrip("/"),
+        "abi_api": os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api"),
+        "sequencer": os.environ.get("RH_SEQUENCER_URL", "https://sequencer.mainnet.chain.robinhood.com"),
+        "os_slug_chain": "robinhood",
+    },
+    "eth": {
+        "name": "Ethereum", "chain_id": 1, "os_chain": "ethereum",
+        "pool": ETH_POOL, "watch": ETH_WATCH,
+        "explorer": "https://etherscan.io",
+        "abi_api": "https://api.etherscan.io/api",
+        "sequencer": "",
+        "os_slug_chain": "ethereum",
+    },
+}
+ACTIVE_CHAIN = os.environ.get("DEFAULT_CHAIN", "rh").strip().lower()
+
+
+def chain_cfg():
+    return CHAINS.get(ACTIVE_CHAIN) or CHAINS["rh"]
+
+
+def use_chain(key):
+    """Swap the live chain. Keeps the existing globals so nothing else changes."""
+    global ACTIVE_CHAIN, CHAIN_ID, RPC_POOL, RPC_POOL_RAW, EXPLORER, BLOCKSCOUT
+    global SEQUENCER_URL, SUBMIT_RPC_URL, RPC_URL, _POOL_W3, _EP_COOL, _WATCH_W3
+    key = key.lower()
+    if key not in CHAINS:
+        raise ValueError(f"unknown chain '{key}' - use: " + ", ".join(CHAINS))
+    c = CHAINS[key]
+    if not c["pool"]:
+        raise ValueError(f"no RPCs configured for {c['name']} (set {key.upper()}_RPC_POOL in .env)")
+    ACTIVE_CHAIN = key
+    CHAIN_ID = c["chain_id"]
+    # first endpoint is reserved for watching; the rest do the minting
+    RPC_POOL = c["pool"][1:] if (not c["watch"] and len(c["pool"]) > 1) else list(c["pool"])
+    RPC_URL = RPC_POOL[0]
+    SUBMIT_RPC_URL = RPC_POOL[0]
+    RPC_POOL_RAW = list(c["pool"]) + [c["watch"]] if c["watch"] else list(c["pool"])
+    EXPLORER = c["explorer"]
+    BLOCKSCOUT = c["abi_api"]
+    SEQUENCER_URL = c["sequencer"]
+    _POOL_W3 = {}
+    _EP_COOL = {}
+    _WATCH_W3 = None
+    return c
+
+
+_WATCH_W3 = None
+
+
+def watch_w3():
+    """Dedicated endpoint for block scanning, so watching never eats mint quota."""
+    global _WATCH_W3
+    if _WATCH_W3 is None:
+        c = chain_cfg()
+        url = c["watch"] or c["pool"][0]
+        _WATCH_W3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 12}))
+    return _WATCH_W3
 MAX_SPEND_ETH = Decimal(os.environ.get("RH_MAX_SPEND_ETH", "0.5") or "0.5")
 CHAIN_ID       = int(os.environ.get("RH_CHAIN_ID", "4663") or "4663")
 BLOCKSCOUT     = os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api").strip()
@@ -945,6 +1018,8 @@ async def help_cmd(update, context):
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
         "/oslogout - clear OpenSea sessions (if they go stale)\n"
         "/osqty <n> - per-wallet qty for OpenSea mints (default: stage max)\n"
+        "/chain <eth|rh> - switch chain\n"
+        "/sweep <collection> [n] - quote the cheapest listings\n"
         "/proofapi <url> - fetch merkle proofs for all wallets from a site API\n"
         "/setproof <wallet> 0x.. - set one wallet calldata manually\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
@@ -1869,7 +1944,7 @@ async def copy_fire(context, chat_id, to, data, value):
 
 async def _copy_loop(context, chat_id, target, interval):
     seen = set()
-    _w3 = w3()
+    _w3 = watch_w3()
     tl = {target.lower()}
     try:
         last_block = await run_blocking(lambda: _w3.eth.block_number)
@@ -1879,149 +1954,33 @@ async def _copy_loop(context, chat_id, target, interval):
     await context.bot.send_message(
         chat_id,
         f"Copy-mint watching {copy_label(target)} ({target})\n"
-        "Scanning new blocks directly (fast). FREE mints fire instantly; PAID mints ask for "
-        "approval (buttons). Watching until /cancel. (No mempool here, so you follow the moment "
-        "their tx lands - you can't pre-empt it.)"
+        "Alerts on ANY mint or purchase - OpenSea, custom website contracts, launchpads, "
+        "ERC721 or ERC1155. Detected from transfer logs, not function names. /cancelcopy to stop."
     )
     while True:
-        txs = []
         try:
             head = await run_blocking(lambda: _w3.eth.block_number)
             if last_block is None:
                 last_block = head
             if head > last_block:
-                # never scan more than 25 blocks in one pass - if we fell behind,
-                # skip ahead rather than hammering the RPC with a huge catch-up
                 start = last_block + 1
                 if head - start > 25:
                     start = head - 25
-                txs, last_block = await run_blocking(scan_blocks_for, _w3, tl, start, head)
+                acqs = await run_blocking(scan_acquisitions, _w3, target, start, head)
+                last_block = head
+                for txh, acq in acqs.items():
+                    if txh in seen:
+                        continue
+                    seen.add(txh)
+                    asyncio.create_task(
+                        report_acquisition(context, chat_id, target, txh, acq, _w3))
             backoff = interval
         except Exception as e:
-            # 429 / rate limit -> ease off instead of retrying at full speed
             if is_rate_limit(e):
-                try:
-                    mark_rate_limited(RPC_POOL[0])
-                except Exception:
-                    pass
-                _w3 = w3()
                 backoff = min(backoff * 2 if backoff else interval, 15.0)
                 await asyncio.sleep(backoff)
             else:
                 await asyncio.sleep(interval)
-            continue
-        for t in list(txs):
-            h = t.get("hash")
-            if not h or h in seen:
-                continue
-            seen.add(h)
-            frm = (t.get("from") or "").lower()
-            to = t.get("to")
-            data = t.get("input") or "0x"
-            if frm != target.lower() or not to:
-                continue
-            if not (data.startswith("0x") and len(data) >= 10 and data[:10].lower() in MINT_SELECTORS):
-                continue
-            to = Web3.to_checksum_address(to)
-            val = int(t.get("value") or "0")
-
-            # Signature-gated WL mint: the 65-byte signature is bound to THEIR
-            # wallet, so replaying it always reverts. Try the collection's PUBLIC
-            # stage instead (that one is copyable); otherwise just report it.
-            if is_signed_mint(data):
-                coll = calldata_collection(data)
-                pd = None
-                if coll:
-                    try:
-                        pd = await run_blocking(read_public_drop, _w3, coll)
-                    except Exception:
-                        pd = None
-                live = False
-                if pd:
-                    now = int(time.time())
-                    live = int(pd[3]) > 0 and int(pd[1]) <= now <= int(pd[2])
-                if live:
-                    try:
-                        fee = await run_blocking(resolve_fee_recipient, _w3, coll)
-                    except Exception:
-                        fee = OPENSEA_FEE_RECIPIENT
-                    price = int(pd[0])
-                    pub_price = Decimal(price) / Decimal(10 ** 18)
-                    try:
-                        _info = await run_blocking(describe_mint, _w3, to, data, val)
-                        _detail = format_mint(_info)
-                    except Exception:
-                        _detail = f"Contract: {coll}"
-                    await context.bot.send_message(
-                        chat_id,
-                        f"{copy_label(target)} minted the WHITELIST phase (can't copy their signature)\n\n"
-                        f"{_detail}\n\n"
-                        f"But the PUBLIC phase is LIVE ({pub_price} ETH) - using that for your wallets.")
-                    STATE["seadrop_fee"] = fee
-                    pub_data = seadrop_calldata(coll, STATE["wallets"][0]["address"], 1) if STATE["wallets"] else None
-                    if pub_data:
-                        if price == 0:
-                            asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub_data, 0))
-                        else:
-                            pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
-                            STATE["pending"][pid] = {"to": SEADROP_ADDR, "data": pub_data, "value": price,
-                                                     "desc": f"{pub_price} ETH -> {coll[:10]}.. (public)"}
-                            kb = InlineKeyboardMarkup([[
-                                InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
-                                InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
-                            await context.bot.send_message(
-                                chat_id,
-                                f"Public stage is PAID: {pub_price} ETH x {len(STATE['wallets'])} wallets "
-                                f"= {pub_price * len(STATE['wallets'])} ETH. Mint?", reply_markup=kb)
-                else:
-                    try:
-                        _info = await run_blocking(describe_mint, _w3, to, data, val)
-                        _detail = format_mint(_info)
-                    except Exception:
-                        _detail = f"Contract: {coll or to}"
-                    await context.bot.send_message(
-                        chat_id,
-                        f"{copy_label(target)} minted a WHITELIST drop - can't auto-copy\n\n"
-                        f"{_detail}\n\n"
-                        f"Their signature only works for their wallet, and no public stage is live yet.\n"
-                        f"-> /oscheck to see if YOUR wallets are allowlisted\n"
-                        f"-> or paste {(coll or to)} to watch for the public phase")
-                continue
-
-            if val == 0:
-                try:
-                    _info = await run_blocking(describe_mint, _w3, to, data, val)
-                    _detail = format_mint(_info)
-                except Exception:
-                    _detail = f"Contract: {to}"
-                await context.bot.send_message(
-                    chat_id,
-                    f"{copy_label(target)} minted (FREE) - copying to all wallets\n\n{_detail}")
-                asyncio.create_task(copy_fire(context, chat_id, to, data, val))
-            else:
-                pid = str(STATE["pending_seq"])
-                STATE["pending_seq"] += 1
-                price = Decimal(val) / Decimal(10 ** 18)
-                STATE["pending"][pid] = {"to": to, "data": data, "value": val, "desc": f"{price} ETH -> {to[:10]}.."}
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
-                    InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}"),
-                ]])
-                try:
-                    _info = await run_blocking(describe_mint, _w3, to, data, val)
-                    _detail = format_mint(_info)
-                except Exception:
-                    _detail = f"Contract: {to}"
-                await context.bot.send_message(
-                    chat_id,
-                    f"{copy_label(target)} minted a PAID drop\n\n{_detail}\n\n"
-                    f"Your cost: {price} ETH x {len(STATE['wallets'])} wallets "
-                    f"= {price * len(STATE['wallets'])} ETH\n"
-                    f"Mint from your wallets?",
-                    reply_markup=kb,
-                )
-        await asyncio.sleep(interval)
-
 
 async def cb_handler(update, context):
     q = update.callback_query
@@ -2062,6 +2021,27 @@ async def cb_handler(update, context):
             await mintall_cmd(update, context)
         elif a == "auto":
             await autoall_cmd(update, context)
+        return
+    if parts[0] in ("sw", "swx"):
+        return
+    if False and parts[0] == "sw" and len(parts) == 3:
+        n, slug = parts[1], parts[2]
+        await do_sweep_quote(
+            lambda *a, **k: context.bot.send_message(q.message.chat_id, *a, **k), slug, int(n))
+        return
+    if parts[0] == "swx":
+        if parts[1] == "-":
+            try:
+                await q.edit_message_text("Sweep cancelled.")
+            except Exception:
+                pass
+            return
+        await context.bot.send_message(
+            q.message.chat_id,
+            "Buy execution needs one live test before I let it spend automatically.\n"
+            f"Open the collection and buy manually this once: https://opensea.io/collection/{parts[1]}\n"
+            "Send me the resulting purchase tx hash + input data and I'll wire the "
+            "one-tap sweep exactly like we did for minting.")
         return
     if parts[0] == "osx":
         act, stage = parts[1], parts[2]
@@ -2143,6 +2123,388 @@ def copywatch_kb():
 @owner_only
 async def copywatch_cmd(update, context):
     await update.effective_message.reply_text(copywatch_text(), reply_markup=copywatch_kb())
+
+
+
+# =====================================================================
+# Trade alerts: detect a tracked wallet BUYING NFTs (Seaport sweeps)
+# =====================================================================
+SEAPORT_ADDRS = {a.lower() for a in [
+    "0x0000000000000068F116a894984e2DB1123eB395",   # Seaport 1.6
+    "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC",   # Seaport 1.5
+    "0x00000000000001ad428e4906aE43D8F9852d0dD6",   # Seaport 1.4
+    "0x00000000006c3852cbEf3e08E8dF289169EdE581",   # Seaport 1.1
+]}
+TRANSFER_TOPIC = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().replace("0x", "")
+
+
+def _topic_addr(t):
+    h = t.hex() if hasattr(t, "hex") else str(t)
+    return "0x" + h[-40:]
+
+
+ERC1155_SINGLE = "0x" + Web3.keccak(
+    text="TransferSingle(address,address,address,uint256,uint256)").hex().replace("0x", "")
+ERC1155_BATCH = "0x" + Web3.keccak(
+    text="TransferBatch(address,address,address,uint256[],uint256[])").hex().replace("0x", "")
+ERC20_TRANSFER = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().replace("0x", "")
+
+
+def parse_nft_receipt(_w3, tx_hash, buyer):
+    """What did `buyer` actually receive, and what did they pay?
+    Handles ERC721 + ERC1155, and ETH *or* token (WETH) payment - a WETH buy has
+    tx.value == 0, so spend has to come from the transfer logs."""
+    r = _w3.eth.get_transaction_receipt(tx_hash)
+    b = buyer.lower()
+    got, token_ids, spent_token = {}, {}, 0
+    for lg in r.get("logs", []):
+        topics = lg.get("topics") or []
+        if not topics:
+            continue
+        t0 = (topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])).lower()
+        if not t0.startswith("0x"):
+            t0 = "0x" + t0
+        addr = Web3.to_checksum_address(lg["address"])
+        # ERC721: Transfer(from,to,tokenId) - 3 indexed
+        if t0 == ERC20_TRANSFER.lower() and len(topics) == 4:
+            if _topic_addr(topics[2]).lower() == b:
+                got[addr] = got.get(addr, 0) + 1
+                tid = int((topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])), 16)
+                token_ids.setdefault(addr, []).append(tid)
+        # ERC20 (WETH etc): Transfer(from,to,value) - 2 indexed, value in data
+        elif t0 == ERC20_TRANSFER.lower() and len(topics) == 3:
+            if _topic_addr(topics[1]).lower() == b:
+                data = lg.get("data")
+                hexd = data.hex() if hasattr(data, "hex") else str(data)
+                try:
+                    spent_token += int(hexd, 16)
+                except Exception:
+                    pass
+        # ERC1155
+        elif t0 in (ERC1155_SINGLE.lower(), ERC1155_BATCH.lower()) and len(topics) >= 4:
+            if _topic_addr(topics[3]).lower() == b:
+                got[addr] = got.get(addr, 0) + 1
+    return got, token_ids, spent_token, r
+
+
+def contract_verified(abi_api, addr):
+    try:
+        url = f"{abi_api}?module=contract&action=getabi&address={addr}"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.loads(r.read().decode())
+        return str(d.get("status")) == "1" and bool(d.get("result")) and d["result"] != "Contract source code not verified"
+    except Exception:
+        return None
+
+
+OS_COLL_BY_CONTRACT = """
+query CollByContract($chain: ChainIdentifier!, $address: Address!) {
+  contract(chain: $chain, address: $address) {
+    collection {
+      slug name isVerified
+      floorPrice { unit symbol }
+      totalSupply
+      connectedTwitterUsername discordUrl externalUrl
+      owners
+    }
+  }
+}
+"""
+
+
+def os_collection_by_contract(session, chain_ident, address):
+    d = os_graphql(session, "", "CollByContract", OS_COLL_BY_CONTRACT,
+                   {"chain": chain_ident, "address": address.lower()})
+    c = ((d.get("contract") or {}).get("collection")) or {}
+    return c or None
+
+
+def enrich_collection(_w3, collection):
+    """Best-effort collection card: name, verified, floor, socials, OS link."""
+    c = chain_cfg()
+    info = {"address": collection, "name": None, "verified": None, "slug": None,
+            "floor": None, "twitter": None, "discord": None, "website": None,
+            "supply": None, "owners": None, "os_url": f"https://opensea.io/assets/{c['os_chain']}/{collection}"}
+    try:
+        info["name"] = read_name(_w3, collection)
+    except Exception:
+        pass
+    info["verified"] = contract_verified(c["abi_api"], collection)
+    sess = None
+    for w in STATE["wallets"]:
+        s = STATE["os_sessions"].get(w["name"])
+        if s is not None:
+            sess = s
+            break
+    if sess is not None:
+        try:
+            oc = os_collection_by_contract(sess, c["os_chain"], collection)
+            if oc:
+                info["slug"] = oc.get("slug")
+                info["name"] = oc.get("name") or info["name"]
+                if oc.get("isVerified") is not None:
+                    info["os_verified"] = oc["isVerified"]
+                fp = oc.get("floorPrice") or {}
+                if fp.get("unit") is not None:
+                    info["floor"] = f"{fp['unit']} {fp.get('symbol') or 'ETH'}"
+                info["twitter"] = oc.get("connectedTwitterUsername")
+                info["discord"] = oc.get("discordUrl")
+                info["website"] = oc.get("externalUrl")
+                info["supply"] = oc.get("totalSupply")
+                info["owners"] = oc.get("owners")
+                if info["slug"]:
+                    info["os_url"] = f"https://opensea.io/collection/{info['slug']}"
+        except Exception:
+            pass
+    return info
+
+
+def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="ETH"):
+    c = chain_cfg()
+    verb = "SWEPT" if count > 1 else "BOUGHT"
+    L = [f"{label} {verb} {count}x  {info['name'] or 'Unknown collection'}"]
+    L.append("")
+    L.append(f"Contract: {info['address']}")
+    L.append(f"Chain: {c['name']}")
+    if spent_wei:
+        eth = Decimal(spent_wei) / Decimal(10 ** 18)
+        each = (eth / count) if count else eth
+        L.append(f"Paid: {eth:.4f} {paid_in}  ({each:.4f} each)")
+    fl = info.get("floor")
+    L.append(f"Floor: {fl or 'unknown'}")
+    if fl and spent_wei and count:
+        try:
+            fnum = Decimal(str(fl).split()[0])
+            each = (Decimal(spent_wei) / Decimal(10 ** 18)) / count
+            if fnum > 0:
+                d = ((each - fnum) / fnum) * 100
+                L.append(f"  -> paid {abs(d):.0f}% {'ABOVE' if d > 0 else 'below'} floor")
+        except Exception:
+            pass
+    v = info.get("os_verified")
+    if v is None:
+        v = info.get("verified")
+    L.append("Verified: " + ("yes" if v is True else "NO - unverified" if v is False else "unknown"))
+    if info.get("supply"):
+        L.append(f"Supply: {info['supply']}" + (f" | owners {info['owners']}" if info.get("owners") else ""))
+    socials = []
+    if info.get("twitter"):
+        socials.append(f"X @{str(info['twitter']).lstrip('@')}")
+    if info.get("website"):
+        socials.append("website")
+    if info.get("discord"):
+        socials.append("discord")
+    L.append("Socials: " + (", ".join(socials) if socials else "none linked"))
+    if token_ids:
+        ids = token_ids[:6]
+        L.append("Token IDs: " + ", ".join(f"#{i}" for i in ids) + ("..." if len(token_ids) > 6 else ""))
+    return "\n".join(L)
+
+
+def sweep_buttons(info, tx_hash=None):
+    c = chain_cfg()
+    rows = [[InlineKeyboardButton("Open collection on OpenSea", url=info["os_url"])]]
+    extra = []
+    if info.get("website"):
+        extra.append(InlineKeyboardButton("Website", url=info["website"]))
+    if info.get("twitter"):
+        extra.append(InlineKeyboardButton("X / Twitter",
+                     url=f"https://x.com/{str(info['twitter']).lstrip('@')}"))
+    if extra:
+        rows.append(extra)
+    if tx_hash:
+        rows.append([InlineKeyboardButton("View transaction", url=f"{c['explorer']}/tx/{tx_hash}")])
+    return InlineKeyboardMarkup(rows)
+
+
+
+ZERO_TOPIC = "0x" + "00" * 32
+
+
+def _pad_addr(a):
+    return "0x" + "0" * 24 + a.lower().replace("0x", "")
+
+
+def scan_acquisitions(_w3, target, from_block, to_block):
+    """Universal NFT-acquisition detector.
+
+    Every mint on every EVM chain emits Transfer(from=0x0, to=buyer), and every
+    purchase emits Transfer(from=seller, to=buyer). So we watch the LOGS, not the
+    function name - that catches custom website mints, SeaDrop, launchpads,
+    anything. Returns {tx_hash: {"collection":.., "count":.., "ids":[..],
+    "is_mint":bool}}.
+    """
+    out = {}
+    topic_to = _pad_addr(target)
+    try:
+        logs = _w3.eth.get_logs({
+            "fromBlock": from_block, "toBlock": to_block,
+            "topics": [ERC20_TRANSFER, None, topic_to],
+        })
+    except Exception:
+        logs = []
+    for lg in logs:
+        topics = lg.get("topics") or []
+        if len(topics) != 4:              # 4 topics == ERC721 (ERC20 has 3)
+            continue
+        h = lg.get("transactionHash")
+        h = h.hex() if hasattr(h, "hex") else str(h)
+        if not h.startswith("0x"):
+            h = "0x" + h
+        frm = _topic_addr(topics[1])
+        coll = Web3.to_checksum_address(lg["address"])
+        tid = int((topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])), 16)
+        e = out.setdefault(h, {"collection": coll, "count": 0, "ids": [],
+                               "is_mint": int(frm, 16) == 0})
+        if e["collection"] == coll:
+            e["count"] += 1
+            e["ids"].append(tid)
+    # ERC1155
+    for topic in (ERC1155_SINGLE, ERC1155_BATCH):
+        try:
+            logs = _w3.eth.get_logs({
+                "fromBlock": from_block, "toBlock": to_block,
+                "topics": [topic, None, None, topic_to],
+            })
+        except Exception:
+            continue
+        for lg in logs:
+            h = lg.get("transactionHash")
+            h = h.hex() if hasattr(h, "hex") else str(h)
+            if not h.startswith("0x"):
+                h = "0x" + h
+            topics = lg.get("topics") or []
+            frm = _topic_addr(topics[2]) if len(topics) > 2 else "0x0"
+            coll = Web3.to_checksum_address(lg["address"])
+            e = out.setdefault(h, {"collection": coll, "count": 0, "ids": [],
+                                   "is_mint": int(frm, 16) == 0})
+            e["count"] += 1
+    return out
+
+
+async def report_acquisition(context, chat_id, target, txh, acq, _w3):
+    """Alert on any mint/purchase - and for MINTS, replicate it across your wallets.
+    Free mints fire immediately; paid mints ask for approval; signature-gated
+    whitelist mints can't be copied so we say so (and fall back to a live public stage)."""
+    try:
+        data, to, eth_val = "0x", None, 0
+        try:
+            tx = await run_blocking(_w3.eth.get_transaction, txh)
+            eth_val = int(tx.get("value") or 0)
+            raw_in = tx.get("input")
+            data = raw_in.hex() if hasattr(raw_in, "hex") else (raw_in or "0x")
+            if not data.startswith("0x"):
+                data = "0x" + data
+            to = tx.get("to")
+        except Exception:
+            pass
+
+        spent, paid_in = eth_val, "ETH"
+        if eth_val == 0:
+            try:
+                _g, _i, spent_token, _r = await run_blocking(parse_nft_receipt, _w3, txh, target)
+                if spent_token:
+                    spent, paid_in = spent_token, "WETH"
+            except Exception:
+                pass
+
+        info = await run_blocking(enrich_collection, _w3, acq["collection"])
+        STATE["last_sweep"] = {"slug": info.get("slug"), "collection": acq["collection"]}
+
+        body = format_trade_alert(copy_label(target), info, acq["count"], spent,
+                                  acq["ids"], paid_in)
+        if acq["is_mint"]:
+            rest = body.split("\n", 1)[1] if "\n" in body else body
+            head = f"{copy_label(target)} MINTED {acq['count']}x  {info['name'] or 'Unknown'}"
+            body = head + "\n" + rest + ("\n(FREE mint)" if spent == 0 else "")
+        await context.bot.send_message(chat_id, body, reply_markup=sweep_buttons(info, txh))
+
+        # ---------- copy-mint: only for mints, only if we can replay the call ----------
+        if not acq["is_mint"] or not to or len(data) < 10 or not STATE["wallets"]:
+            return
+        to = Web3.to_checksum_address(to)
+
+        if is_signed_mint(data):
+            coll = calldata_collection(data) or acq["collection"]
+            pd = None
+            try:
+                pd = await run_blocking(read_public_drop, _w3, coll)
+            except Exception:
+                pd = None
+            now = int(time.time())
+            live = bool(pd) and int(pd[3]) > 0 and int(pd[1]) <= now <= int(pd[2])
+            if live:
+                try:
+                    STATE["seadrop_fee"] = await run_blocking(resolve_fee_recipient, _w3, coll)
+                except Exception:
+                    pass
+                price = int(pd[0])
+                pub = seadrop_calldata(coll, STATE["wallets"][0]["address"], 1)
+                if price == 0:
+                    await context.bot.send_message(
+                        chat_id, "Their WL signature can't be copied - but the PUBLIC stage "
+                                 "is live and free. Minting that for all wallets.")
+                    asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub, 0))
+                else:
+                    pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
+                    pe = Decimal(price) / Decimal(10 ** 18)
+                    STATE["pending"][pid] = {"to": SEADROP_ADDR, "data": pub, "value": price,
+                                             "desc": f"{pe} ETH public stage"}
+                    kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
+                        InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
+                    await context.bot.send_message(
+                        chat_id, f"WL signature can't be copied, but PUBLIC is live at {pe} ETH.\n"
+                                 f"Mint from your {len(STATE['wallets'])} wallets "
+                                 f"({pe * len(STATE['wallets'])} ETH)?", reply_markup=kb)
+            else:
+                await context.bot.send_message(
+                    chat_id, "This was a signature-gated WL mint - it can't be copied (the "
+                             "signature only works for their wallet) and no public stage is live.\n"
+                             "-> paste the collection link to check if YOUR wallets are allowlisted.")
+            return
+
+        if spent == 0:
+            await context.bot.send_message(
+                chat_id, f"FREE mint - copying to your {len(STATE['wallets'])} wallets...")
+            asyncio.create_task(copy_fire(context, chat_id, to, data, 0))
+        else:
+            pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
+            pe = Decimal(eth_val) / Decimal(10 ** 18)
+            tot = pe * len(STATE["wallets"])
+            STATE["pending"][pid] = {"to": to, "data": data, "value": eth_val,
+                                     "desc": f"{pe} ETH -> {to[:10]}.."}
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
+                InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
+            await context.bot.send_message(
+                chat_id, f"PAID mint {pe} ETH x {len(STATE['wallets'])} wallets = {tot} ETH.\n"
+                         f"Copy it?", reply_markup=kb)
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id, f"{copy_label(target)} acquired NFTs - lookup failed: {safe(e, 60)}")
+
+
+async def handle_trade(context, chat_id, target, tx, _w3):
+    """A tracked wallet interacted with Seaport - report exactly what they bought."""
+    try:
+        h = tx.get("hash")
+        got, ids, spent_token, receipt = await run_blocking(parse_nft_receipt, _w3, h, target)
+        if not got:
+            return                      # they sold, or it wasn't an NFT they received
+        collection, count = max(got.items(), key=lambda kv: kv[1])
+        info = await run_blocking(enrich_collection, _w3, collection)
+        eth_val = int(tx.get("value") or 0)
+        spent, paid_in = (eth_val, "ETH") if eth_val > 0 else (spent_token, "WETH")
+        STATE["last_sweep"] = {"slug": info.get("slug"), "collection": collection}
+        await context.bot.send_message(
+            chat_id,
+            format_trade_alert(copy_label(target), info, count, spent,
+                               ids.get(collection), paid_in),
+            reply_markup=sweep_buttons(info, h))
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id, f"{copy_label(target)} traded on Seaport - detail lookup failed: {safe(e, 60)}")
 
 
 @owner_only
@@ -2378,8 +2740,22 @@ async def os_autoload(update, context, slug):
                 when = " | ENDED"
             else:
                 when = " | LIVE NOW"
-        lines.append(f"\n{os_stage_label(t)}: {len(elig_map[t])} wallets eligible | "
+        names = elig_map[t]
+        lines.append(f"\n{os_stage_label(t)}: {len(names)}/{len(ws)} wallets | "
                      f"max {max_map.get(t, '?')}/wallet | {pe}{when}")
+        # name the eligible wallets, and show who's missing out
+        by_addr = {w["name"]: w["address"] for w in STATE["wallets"]}
+        if len(names) <= 8:
+            for n in names:
+                a = by_addr.get(n, "")
+                lines.append(f"   {n}  {a[:8]}..{a[-4:]}" if a else f"   {n}")
+        else:
+            lines.append("   " + ", ".join(names))
+        missing = [w["name"] for w in ws if w["name"] not in names]
+        if missing and len(missing) <= 8:
+            lines.append(f"   not eligible: {', '.join(missing)}")
+        elif missing:
+            lines.append(f"   not eligible: {len(missing)} wallets")
     if errs or login_errs:
         bad = (login_errs + errs)[:3]
         lines.append(f"\n({len(login_errs)+len(errs)} wallet(s) errored - tap Refresh: {bad[0]})")
@@ -2838,6 +3214,127 @@ async def setproof_cmd(update, context):
 
 
 @owner_only
+async def chain_cmd(update, context):
+    if not context.args:
+        c = chain_cfg()
+        lines = [f"Active: {c['name']} (chain {c['chain_id']})",
+                 f"Mint pool: {len(RPC_POOL)} endpoint(s) | watch: "
+                 + ("dedicated" if c["watch"] else "pool[0]"), "", "Available:"]
+        for k, v in CHAINS.items():
+            mark = " <-- active" if k == ACTIVE_CHAIN else ""
+            lines.append(f"  /chain {k} - {v['name']} ({len(v['pool'])} rpc){mark}")
+        await update.effective_message.reply_text("\n".join(lines))
+        return
+    try:
+        c = use_chain(context.args[0])
+    except Exception as e:
+        await update.effective_message.reply_text(str(e))
+        return
+    STATE.update(contract=None, abi=None, fn=None, fn_inputs=None,
+                 seadrop=False, seadrop_collection=None, os_ctx=None, os_sessions={})
+    for w in STATE["wallets"]:
+        w["armed"] = None
+    await update.effective_message.reply_text(
+        f"Switched to {c['name']} (chain {c['chain_id']}).\n"
+        f"{len(RPC_POOL)} mint endpoint(s), watch on "
+        + ("dedicated RPC" if c["watch"] else "pool[0]") + ".\n"
+        "Loaded collection + OpenSea sessions cleared. /wallets to check balances here.")
+
+
+# ---------------------------------------------------------------------
+# Sweep = buy the cheapest listings. Goes through OpenSea order fulfilment,
+# so it always asks for confirmation showing the exact spend first.
+# ---------------------------------------------------------------------
+OS_LISTINGS_QUERY = """
+query BestListings($slug: String!, $limit: Int!) {
+  collectionBySlug(slug: $slug) {
+    ... on Collection {
+      slug name
+      bestListings(first: $limit) {
+        edges { node {
+          pricePerItem { unit symbol }
+          item { __typename ... on Nft { tokenId contractAddress } }
+        } }
+      }
+    }
+  }
+}
+"""
+
+
+async def sweep_quote(slug, n):
+    """Read the n cheapest listings so we can show a real total before spending."""
+    sess = None
+    for w in STATE["wallets"]:
+        s = STATE["os_sessions"].get(w["name"])
+        if s is not None:
+            sess = s
+            break
+    if sess is None:
+        raise RuntimeError("no OpenSea session - paste the collection link first")
+    d = await run_blocking(os_graphql, sess, slug, "BestListings", OS_LISTINGS_QUERY,
+                           {"slug": slug, "limit": int(n)})
+    coll = d.get("collectionBySlug") or {}
+    out = []
+    for e in ((coll.get("bestListings") or {}).get("edges") or []):
+        node = e.get("node") or {}
+        p = node.get("pricePerItem") or {}
+        it = node.get("item") or {}
+        out.append({"price": Decimal(str(p.get("unit", "0"))),
+                    "symbol": p.get("symbol") or "ETH",
+                    "token_id": it.get("tokenId"),
+                    "contract": it.get("contractAddress")})
+    return coll.get("name") or slug, out
+
+
+@owner_only
+async def sweep_cmd(update, context):
+    slug = None
+    n = 1
+    if context.args:
+        slug = os_slug(context.args[0]) or (STATE.get("last_sweep") or {}).get("slug")
+        if len(context.args) > 1:
+            try:
+                n = max(1, min(20, int(context.args[1])))
+            except ValueError:
+                pass
+    else:
+        slug = (STATE.get("last_sweep") or {}).get("slug")
+    if not slug:
+        await update.effective_message.reply_text(
+            "Usage: /sweep <collection link or slug> [count]\n"
+            "Shows the cheapest listings and the exact total before anything is spent.")
+        return
+    await do_sweep_quote(update.effective_message.reply_text, slug, n)
+
+
+async def do_sweep_quote(reply, slug, n):
+    try:
+        name, listings = await sweep_quote(slug, n)
+    except Exception as e:
+        await reply(f"Couldn't read listings: {safe(e, 90)}")
+        return
+    if not listings:
+        await reply(f"No live listings found for {slug}.")
+        return
+    total = sum(l["price"] for l in listings)
+    lines = [f"SWEEP QUOTE - {name}", f"{len(listings)} cheapest listing(s):"]
+    for l in listings:
+        lines.append(f"  #{l['token_id']}  {l['price']} {l['symbol']}")
+    lines.append(f"\nTotal: {total} ETH")
+    if total > MAX_SPEND_ETH:
+        lines.append(f"\nSPEND GUARD: over your {MAX_SPEND_ETH} ETH limit - blocked.")
+        await reply("\n".join(lines))
+        return
+    lines.append("\nBuying is NOT yet battle-tested - confirm only if you accept that.")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"CONFIRM BUY {total} ETH", callback_data=f"swx|{slug}|{len(listings)}"),
+        InlineKeyboardButton("Cancel", callback_data="swx|-|0"),
+    ]])
+    await reply("\n".join(lines), reply_markup=kb)
+
+
+@owner_only
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
     lines = [f"RPC pool: {n} endpoint(s), {len(healthy_endpoints())} healthy | "
@@ -2916,12 +3413,16 @@ def main():
         ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("setproof", setproof_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("chain", chain_cmd), ("sweep", sweep_cmd), ("setproof", setproof_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard_msg))
 
+    try:
+        use_chain(ACTIVE_CHAIN)
+    except Exception as e:
+        log.warning("chain init: %s", e)
     log.info("Bot up. owner=%s chain=%s wallets=%d endpoints=%d",
              OWNER_ID, CHAIN_ID, len(STATE["wallets"]), len(RPC_POOL))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

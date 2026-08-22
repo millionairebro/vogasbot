@@ -2047,19 +2047,29 @@ async def cb_handler(update, context):
         act, stage = parts[1], parts[2]
         if act == "r":
             ctx = STATE.get("os_ctx")
-            if ctx:
-                STATE["os_sessions"] = {}
-                await os_autoload(update, context, ctx["slug"])
+            if not ctx:
+                await context.bot.send_message(
+                    q.message.chat_id,
+                    "Nothing loaded (bot restarted). Paste the OpenSea link again.")
+                return
+            STATE["os_sessions"] = {}
+            await os_autoload(update, context, ctx["slug"])
             return
         if act == "m":
-            await os_fire_stage(context, q.message.chat_id, stage)
+            await context.bot.send_message(
+                q.message.chat_id, f"Minting {os_stage_label(stage)} now...")
+            spawn(context, q.message.chat_id,
+                  os_fire_stage(context, q.message.chat_id, stage), "Mint")
             return
         if act == "a":
             old = STATE["auto_tasks"].get("_os")
             if old and not old.done():
                 old.cancel()
-            STATE["auto_tasks"]["_os"] = asyncio.create_task(
-                os_auto_stage(context, q.message.chat_id, stage))
+            await context.bot.send_message(
+                q.message.chat_id, f"Arming AUTO {os_stage_label(stage)}...")
+            STATE["auto_tasks"]["_os"] = spawn(
+                context, q.message.chat_id,
+                os_auto_stage(context, q.message.chat_id, stage), "Auto-mint")
             return
     if parts[0] == "cw":
         if len(parts) == 2 and parts[1] == "add":
@@ -2867,15 +2877,36 @@ async def os_blast_armed(context, chat_id, armed):
     return [f for f in await asyncio.gather(*[fire(n, p) for n, p in armed.items()]) if f]
 
 
+def spawn(context, chat_id, coro, label="task"):
+    """asyncio.create_task swallows exceptions - this reports them to you instead."""
+    t = asyncio.create_task(coro)
+
+    def _done(fut):
+        try:
+            fut.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            asyncio.create_task(context.bot.send_message(
+                chat_id, f"{label} failed: {safe(e, 120)}"))
+    t.add_done_callback(_done)
+    return t
+
+
 async def os_auto_stage(context, chat_id, stage_type, qty=None):
     """Sleep until the phase opens (zero RPC), PRE-ARM shortly before, then blast at T+0."""
     ctx = STATE.get("os_ctx")
     if not ctx:
+        await context.bot.send_message(
+            chat_id,
+            "That collection isn't loaded any more (the bot restarted, so the buttons on "
+            "that older message are stale).\nPaste the OpenSea link again and use the NEW "
+            "buttons.")
         return
     meta = ctx["meta"].get(stage_type) or {}
     start = meta.get("start")
     names = ctx["elig"].get(stage_type) or []
-    wallets = only if only else [w for w in STATE["wallets"] if w["name"] in names]
+    wallets = [w for w in STATE["wallets"] if w["name"] in names]
     if not wallets:
         await context.bot.send_message(chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
         return

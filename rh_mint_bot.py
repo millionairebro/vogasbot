@@ -333,6 +333,31 @@ def wallet_w3(wal):
     return wallet_rpc(wal)[0]
 
 
+def narrow_targets(wal):
+    """Sequencer (ordering authority) + this wallet's own endpoint. Keeps the speed
+    benefit of hitting the sequencer directly without a 12x request multiplier."""
+    _, url = wallet_rpc(wal)
+    out = []
+    if SEQUENCER_URL:
+        out.append(SEQUENCER_URL)
+    if url not in out:
+        out.append(url)
+    return out
+
+
+_FEE_CACHE = {"t": 0.0, "v": None}
+
+
+def cached_fees(_w3, ttl=4.0):
+    """Fee lookup is identical for every wallet - fetch once per burst, not 18x."""
+    now = time.time()
+    if _FEE_CACHE["v"] and (now - _FEE_CACHE["t"]) < ttl:
+        return _FEE_CACHE["v"]
+    v = suggest_fees(_w3)
+    _FEE_CACHE.update(t=now, v=v)
+    return v
+
+
 _RR = {"i": 0}
 
 
@@ -370,7 +395,7 @@ def _post_raw(url, body, timeout=10):
         return json.loads(r.read().decode())
 
 
-def blast_raw(raw_tx):
+def blast_raw(raw_tx, only_urls=None):
     """Fire one signed tx at EVERY endpoint at once; first to reach the sequencer wins.
     Duplicates are harmless - the chain dedupes by tx hash ('already known')."""
     raw_hex = raw_tx.hex() if isinstance(raw_tx, (bytes, bytearray)) else str(raw_tx)
@@ -379,7 +404,7 @@ def blast_raw(raw_tx):
     txh = "0x" + Web3.keccak(hexstr=raw_hex).hex().replace("0x", "")
     body = json.dumps({"jsonrpc": "2.0", "method": "eth_sendRawTransaction",
                        "params": [raw_hex], "id": 1})
-    targets = blast_targets()
+    targets = list(only_urls) if only_urls else blast_targets()
     errs = []
     with ThreadPoolExecutor(max_workers=max(2, len(targets))) as ex:
         futs = [ex.submit(_post_raw, u, body) for u in targets]
@@ -546,10 +571,12 @@ def sim_wallet(_w3, wal):
     })
 
 
-def do_send(_w3, raw):
-    # blast to sequencer + all pool endpoints at once (fastest path in)
+def do_send(_w3, raw, narrow=None):
+    """narrow = list of endpoints to use instead of the full blast. When many wallets
+    fire together we pass [sequencer, that wallet's own endpoint] so 18 wallets don't
+    turn into 250+ simultaneous requests and trip rate limits."""
     try:
-        return blast_raw(raw)
+        return blast_raw(raw, narrow)
     except Exception:
         h = _w3.eth.send_raw_transaction(raw).hex()
         return h if h.startswith("0x") else "0x" + h
@@ -1797,11 +1824,18 @@ def build_custom_tx(_w3, wal, to, data, value, nonce=None):
     acct = wal["account"]
     if nonce is None:
         nonce = _w3.eth.get_transaction_count(acct.address, "pending")
-    max_fee, prio = suggest_fees(_w3)
-    try:
-        gas = int(_w3.eth.estimate_gas({"from": acct.address, "to": to, "data": data, "value": value}) * 1.25)
-    except Exception:
-        gas = STATE.get("gas_limit_override") or DEFAULT_GAS
+    max_fee, prio = cached_fees(_w3)
+    if STATE.get("gas_limit_override"):
+        gas = STATE["gas_limit_override"]
+    elif STATE.get("batch_gas"):
+        gas = STATE["batch_gas"]          # reuse the estimate from the first wallet
+    else:
+        try:
+            gas = int(_w3.eth.estimate_gas(
+                {"from": acct.address, "to": to, "data": data, "value": value}) * 1.25)
+            STATE["batch_gas"] = gas
+        except Exception:
+            gas = DEFAULT_GAS
     return {
         "chainId": CHAIN_ID, "to": to, "from": acct.address, "data": data, "value": value,
         "nonce": nonce, "gas": gas, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
@@ -1945,7 +1979,6 @@ async def copy_fire(context, chat_id, to, data, value):
 async def _copy_loop(context, chat_id, target, interval):
     seen = set()
     _w3 = watch_w3()
-    tl = {target.lower()}
     try:
         last_block = await run_blocking(lambda: _w3.eth.block_number)
     except Exception:
@@ -1972,15 +2005,20 @@ async def _copy_loop(context, chat_id, target, interval):
                     if txh in seen:
                         continue
                     seen.add(txh)
-                    asyncio.create_task(
-                        report_acquisition(context, chat_id, target, txh, acq, _w3))
+                    spawn(context, chat_id,
+                          report_acquisition(context, chat_id, target, txh, acq, _w3),
+                          f"{copy_label(target)} alert")
+                if len(seen) > 500:                 # keep memory bounded
+                    seen = set(list(seen)[-200:])
             backoff = interval
         except Exception as e:
             if is_rate_limit(e):
                 backoff = min(backoff * 2 if backoff else interval, 15.0)
                 await asyncio.sleep(backoff)
-            else:
-                await asyncio.sleep(interval)
+                continue
+            await asyncio.sleep(interval)
+            continue
+        await asyncio.sleep(interval)          # <-- pace the loop (was missing)
 
 async def cb_handler(update, context):
     q = update.callback_query
@@ -2792,6 +2830,7 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
             chat_id, f"SPEND GUARD: {total} ETH needed, limit is {MAX_SPEND_ETH}. "
                      f"Raise RH_MAX_SPEND_ETH or lower qty with /osqty.")
         return
+    STATE["batch_gas"] = None
     await context.bot.send_message(
         chat_id, f"FIRING {os_stage_label(stage_type)} - {len(wallets)} wallets x{per} "
                  f"({total} ETH total)")
@@ -2821,7 +2860,7 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
             tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
                                     action["data"], action["value"])
             raw = sign_wallet(_pw3, wal, tx)
-            txh = await run_blocking(do_send, _pw3, raw)
+            txh = await run_blocking(do_send, _pw3, raw, narrow_targets(wal))
             await context.bot.send_message(chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, wal["name"]))
             STATE.setdefault("os_done", {})[wal["name"]] = True
@@ -2868,7 +2907,9 @@ async def os_blast_armed(context, chat_id, armed):
     async def fire(name, pair):
         raw, _pw3 = pair
         try:
-            txh = await run_blocking(do_send, _pw3, raw)
+            wal = next((w for w in STATE["wallets"] if w["name"] == name), None)
+            txh = await run_blocking(do_send, _pw3, raw,
+                                     narrow_targets(wal) if wal else None)
             await context.bot.send_message(chat_id, f"[{name}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, name))
             return None

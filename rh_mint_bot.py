@@ -69,11 +69,27 @@ RH_WATCH = os.environ.get("RH_WATCH_RPC", "").strip()
 CHAINS = {
     "rh": {
         "name": "Robinhood Chain", "chain_id": 4663, "os_chain": "robinhood",
-        "pool": RPC_POOL, "watch": RH_WATCH,
+        # public RPC appended: different provider, so it does NOT share the
+        # per-account rate limit that all your Alchemy keys sit behind
+        "pool": RPC_POOL + [u for u in [
+            os.environ.get("RH_PUBLIC_RPC", "https://rpc.mainnet.chain.robinhood.com").strip()
+        ] if u and u not in RPC_POOL],
+        "watch": RH_WATCH,
         "explorer": os.environ.get("RH_EXPLORER", "https://robinhoodchain.blockscout.com").rstrip("/"),
         "abi_api": os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api"),
         "sequencer": os.environ.get("RH_SEQUENCER_URL", "https://sequencer.mainnet.chain.robinhood.com"),
+        "public": os.environ.get("RH_PUBLIC_RPC", "https://rpc.mainnet.chain.robinhood.com").strip(),
         "os_slug_chain": "robinhood",
+    },
+    "ink": {
+        "name": "Ink", "chain_id": 57073, "os_chain": "ink",
+        "pool": _pool("INK_RPC_POOL", "https://rpc-gel.inkonchain.com"),
+        "watch": os.environ.get("INK_WATCH_RPC", "").strip(),
+        "explorer": "https://explorer.inkonchain.com",
+        "abi_api": "https://explorer.inkonchain.com/api",
+        "sequencer": "",
+        "public": os.environ.get("INK_PUBLIC_RPC", "https://rpc-gel.inkonchain.com").strip(),
+        "os_slug_chain": "ink",
     },
     "eth": {
         "name": "Ethereum", "chain_id": 1, "os_chain": "ethereum",
@@ -81,10 +97,15 @@ CHAINS = {
         "explorer": "https://etherscan.io",
         "abi_api": "https://api.etherscan.io/api",
         "sequencer": "",
+        "public": os.environ.get("ETH_PUBLIC_RPC", "https://ethereum-rpc.publicnode.com").strip(),
         "os_slug_chain": "ethereum",
     },
 }
 ACTIVE_CHAIN = os.environ.get("DEFAULT_CHAIN", "rh").strip().lower()
+# copy-watching always runs on ALL of these at once - no chain switching needed
+WATCH_CHAINS = [c.strip().lower() for c in
+                os.environ.get("WATCH_CHAINS", "eth,ink,rh").split(",") if c.strip()]
+COPYWATCH_FILE = os.environ.get("COPYWATCH_FILE", "copywatch.json").strip()
 
 
 def chain_cfg():
@@ -94,7 +115,7 @@ def chain_cfg():
 def use_chain(key):
     """Swap the live chain. Keeps the existing globals so nothing else changes."""
     global ACTIVE_CHAIN, CHAIN_ID, RPC_POOL, RPC_POOL_RAW, EXPLORER, BLOCKSCOUT
-    global SEQUENCER_URL, SUBMIT_RPC_URL, RPC_URL, _POOL_W3, _EP_COOL, _WATCH_W3
+    global SEQUENCER_URL, SUBMIT_RPC_URL, RPC_URL, _POOL_W3, _EP_COOL
     key = key.lower()
     if key not in CHAINS:
         raise ValueError(f"unknown chain '{key}' - use: " + ", ".join(CHAINS))
@@ -113,21 +134,25 @@ def use_chain(key):
     SEQUENCER_URL = c["sequencer"]
     _POOL_W3 = {}
     _EP_COOL = {}
-    _WATCH_W3 = None
+    _WATCH_CACHE.pop(key, None)
     return c
 
 
 _WATCH_W3 = None
 
 
-def watch_w3():
-    """Dedicated endpoint for block scanning, so watching never eats mint quota."""
-    global _WATCH_W3
-    if _WATCH_W3 is None:
-        c = chain_cfg()
-        url = c["watch"] or c["pool"][0]
-        _WATCH_W3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 12}))
-    return _WATCH_W3
+_WATCH_CACHE = {}
+
+
+def watch_w3(chain_key=None):
+    """Read-only client for watching/eligibility. Uses the PUBLIC rpc by default so
+    your paid endpoints stay free for actual minting."""
+    key = (chain_key or ACTIVE_CHAIN).lower()
+    if key not in _WATCH_CACHE:
+        c = CHAINS.get(key) or chain_cfg()
+        url = c.get("watch") or c.get("public") or (c["pool"][0] if c["pool"] else RPC_URL)
+        _WATCH_CACHE[key] = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 12}))
+    return _WATCH_CACHE[key]
 MAX_SPEND_ETH = Decimal(os.environ.get("RH_MAX_SPEND_ETH", "0.5") or "0.5")
 CHAIN_ID       = int(os.environ.get("RH_CHAIN_ID", "4663") or "4663")
 BLOCKSCOUT     = os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api").strip()
@@ -253,6 +278,40 @@ def seadrop_calldata(collection, minter, qty):
     ).hex()
     return "0x" + sel + enc
 
+# ---------------- copy watchlist persistence ----------------
+def load_watchlist():
+    """Single loader. Accepts both the dict and the older list format."""
+    try:
+        if not os.path.exists(COPYWATCH_FILE):
+            return {}
+        raw = json.load(open(COPYWATCH_FILE))
+        out = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                out[Web3.to_checksum_address(k)] = v or ""
+        elif isinstance(raw, list):
+            for e in raw:
+                if isinstance(e, str):
+                    out[Web3.to_checksum_address(e)] = ""
+                elif isinstance(e, dict) and e.get("address"):
+                    out[Web3.to_checksum_address(e["address"])] = e.get("label") or ""
+        return out
+    except Exception as ex:
+        log.warning("watchlist load: %s", ex)
+        return {}
+
+
+def save_watchlist():
+    """Single writer - dict format {address: label}."""
+    try:
+        with open(COPYWATCH_FILE, "w") as fh:
+            json.dump(STATE.get("copy_targets") or {}, fh, indent=2)
+        return True
+    except Exception as ex:
+        log.warning("watchlist save: %s", ex)
+        return False
+
+
 # ------------------------------------------------------------------ state
 STATE = {
     "wallets":      [],     # list of {name,key,account,address,qty,value_wei,calldata,armed,armed_nonce}
@@ -268,8 +327,11 @@ STATE = {
     "gas_max_fee":  None,
     "gas_priority": None,
     "gas_limit_override": None,
-    "copy_tasks":   {},
-    "copy_labels":  {},
+    "copy_tasks":   {},      # chain_key -> watcher task
+    "copy_targets": {},      # address -> label (persisted)
+    "copy_paused":  False,   # True after /cancelcopy - blocks auto-restart
+    "copy_labels":  {},      # legacy alias, kept so copy_label() is safe
+
     "os_sessions":  {},
     "os_slug":      None,
     "os_ctx":       None,
@@ -333,6 +395,14 @@ def wallet_w3(wal):
     return wallet_rpc(wal)[0]
 
 
+def rotate_wallet_rpc(wal):
+    """Push this wallet onto a different healthy endpoint (its current one is dead)."""
+    hs = healthy_endpoints()
+    if len(hs) > 1:
+        wal["rpc_idx"] = (wal.get("rpc_idx", 0) + 1) % len(hs)
+    return wallet_rpc(wal)
+
+
 def narrow_targets(wal):
     """Sequencer (ordering authority) + this wallet's own endpoint. Keeps the speed
     benefit of hitting the sequencer directly without a 12x request multiplier."""
@@ -343,6 +413,106 @@ def narrow_targets(wal):
     if url not in out:
         out.append(url)
     return out
+
+
+async def send_with_failover(wal, to, data, value, tries=3):
+    """Build, sign and send for one wallet. If its endpoint is rate-limited or dead,
+    mark it cooling and retry on a healthy one instead of just failing."""
+    last = None
+    for _ in range(max(1, tries)):
+        _w3, url = wallet_rpc(wal)
+        try:
+            tx = await run_blocking(build_custom_tx, _w3, wal, to, data, value)
+            raw = sign_wallet(_w3, wal, tx)
+            return await run_blocking(do_send, _w3, raw, narrow_targets(wal))
+        except Exception as e:
+            last = e
+            if is_rate_limit(e) or "timeout" in str(e).lower():
+                mark_rate_limited(url)
+                rotate_wallet_rpc(wal)
+                continue
+            raise
+    raise last if last else RuntimeError("send failed")
+
+
+def chain_urls(ck):
+    """Usable endpoints for a chain: its private pool if configured, else its public rpc."""
+    c = CHAINS.get(ck) or chain_cfg()
+    urls = [u for u in (c.get("pool") or []) if u] or [c.get("public")]
+    return [u for u in urls if u]
+
+
+def wallet_rpc_ck(wal, ck):
+    """(web3, url) for this wallet ON A SPECIFIC CHAIN, skipping cooling endpoints."""
+    urls = chain_urls(ck)
+    now = time.time()
+    ok = [u for u in urls if _EP_COOL.get(u, 0) <= now] or urls
+    url = ok[wal.get("rpc_idx", 0) % len(ok)]
+    return w3_for(url), url
+
+
+def narrow_targets_ck(wal, ck):
+    c = CHAINS.get(ck) or chain_cfg()
+    _, url = wallet_rpc_ck(wal, ck)
+    out = [u for u in [c.get("sequencer")] if u]
+    if url not in out:
+        out.append(url)
+    return out
+
+
+def build_tx_ck(ck, _w3, wal, to, data, value, nonce=None):
+    """Build a tx with the RIGHT chainId for the chain the mint happened on."""
+    acct = wal["account"]
+    if nonce is None:
+        nonce = _w3.eth.get_transaction_count(acct.address, "pending")
+    max_fee, prio = suggest_fees(_w3)
+    try:
+        gas = int(_w3.eth.estimate_gas(
+            {"from": acct.address, "to": to, "data": data, "value": value}) * 1.25)
+    except Exception:
+        gas = STATE.get("gas_limit_override") or DEFAULT_GAS
+    return {
+        "chainId": (CHAINS.get(ck) or chain_cfg())["chain_id"],
+        "to": to, "from": acct.address, "data": data, "value": value,
+        "nonce": nonce, "gas": gas, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
+    }
+
+
+async def send_ck(wal, ck, to, data, value, tries=3):
+    """Build+sign+send on a specific chain, rotating off dead endpoints."""
+    last = None
+    for _ in range(max(1, tries)):
+        _w3, url = wallet_rpc_ck(wal, ck)
+        try:
+            tx = await run_blocking(build_tx_ck, ck, _w3, wal, to, data, value)
+            raw = sign_wallet(_w3, wal, tx)
+            return await run_blocking(do_send, _w3, raw, narrow_targets_ck(wal, ck))
+        except Exception as e:
+            last = e
+            if is_rate_limit(e) or "timeout" in str(e).lower():
+                mark_rate_limited(url)
+                wal["rpc_idx"] = wal.get("rpc_idx", 0) + 1
+                continue
+            raise
+    raise last if last else RuntimeError("send failed")
+
+
+async def send_raw_failover(wal, raw, tries=3):
+    """Send a pre-signed raw tx: narrow targets (sequencer + own endpoint) so 20
+    wallets don't become 280 requests, and rotate off a dead endpoint on 429."""
+    last = None
+    for _ in range(max(1, tries)):
+        _w3, url = wallet_rpc(wal)
+        try:
+            return await run_blocking(do_send, _w3, raw, narrow_targets(wal))
+        except Exception as e:
+            last = e
+            if is_rate_limit(e) or "timeout" in str(e).lower():
+                mark_rate_limited(url)
+                rotate_wallet_rpc(wal)
+                continue
+            raise
+    raise last if last else RuntimeError("send failed")
 
 
 _FEE_CACHE = {"t": 0.0, "v": None}
@@ -543,7 +713,7 @@ def build_wallet_tx(_w3, wal, nonce=None):
     value = wallet_value(wal)
     if nonce is None:
         nonce = _w3.eth.get_transaction_count(acct.address, "pending")
-    max_fee, prio = suggest_fees(_w3)
+    max_fee, prio = cached_fees(_w3)
     try:
         gas = int(_w3.eth.estimate_gas({
             "from": acct.address, "to": STATE["contract"], "data": data, "value": value
@@ -1005,6 +1175,8 @@ def owner_only(fn):
 # ------------------------------------------------------------------ commands
 @owner_only
 async def start_cmd(update, context):
+    if STATE.get("copy_targets"):
+        ensure_watchers(context, update.effective_chat.id)
     await update.effective_message.reply_text(
         "Robinhood Chain MULTI-WALLET mint bot - self-hosted.\n\n"
         "Keys live in wallets.json on this machine only, never in chat. Only your Telegram ID "
@@ -1050,7 +1222,10 @@ async def help_cmd(update, context):
         "/proofapi <url> - fetch merkle proofs for all wallets from a site API\n"
         "/setproof <wallet> 0x.. - set one wallet calldata manually\n"
         "/mintloop <n> [delayMs] - send n mint txs per wallet (high-cap drops)\n"
-        "/copy 0xADDR [name] - track a wallet (named alerts)\n"
+        "/copy 0xADDR [name] - track a wallet (watches ALL chains)\n"
+        "/copyadd 0xa 0xb:name ... - mass-add tracked wallets\n"
+        "/copyremove 0xa | all - untrack\n"
+        "/copytest 0xADDR [blocks] - prove copy-watching sees their activity\n"
         "/rename 0xADDR <name> - rename a tracked wallet\n"
         "/copywatch - view/manage copy watchlist (buttons)\n"
         "/rpcstatus - check the RPC pool endpoints\n"
@@ -1361,7 +1536,7 @@ async def _fire_all(update, only_eligible=True):
             if raw is None:
                 tx = await run_blocking(build_wallet_tx, _w3, wal, None)
                 raw = sign_wallet(_w3, wal, tx)
-            txh = await run_blocking(do_send, _sw, raw)
+            txh = await send_raw_failover(wal, raw)
             wal["armed"] = None
             asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
             return (wal["name"], f"SENT {txh}")
@@ -1484,7 +1659,7 @@ async def _wallet_hunt(update, wal, interval, deadline=None):
             if raw is None:
                 tx = await run_blocking(build_wallet_tx, _w3, wal, None)
                 raw = sign_wallet(_w3, wal, tx)
-            txh = await run_blocking(do_send, _sw, raw)
+            txh = await send_raw_failover(wal, raw)
             wal["armed"] = None
             await update.effective_message.reply_text(f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(_confirm(update, _w3, txh, wal["name"]))
@@ -1627,6 +1802,9 @@ def _stop_schedule():
 
 
 def _stop_copy():
+    """Stops the chain watchers and KEEPS them stopped (copy_paused) until you add a
+    wallet or run /copywatch. Your tracked list is kept - /copyremove all clears it."""
+    STATE["copy_paused"] = True
     n = 0
     for t in STATE["copy_tasks"].values():
         if t and not t.done():
@@ -1656,8 +1834,11 @@ async def cancelschedule_cmd(update, context):
 
 @owner_only
 async def cancelcopy_cmd(update, context):
+    n = _stop_copy()
     await update.effective_message.reply_text(
-        "Copy-mint stopped." if _stop_copy() else "Copy-mint wasn't running.")
+        (f"Copy-mint stopped ({n} chain watcher(s)). Stays off until you /copywatch "
+         "or add a wallet. Your list is kept.") if n else
+        "Copy-mint wasn't running (now marked paused).")
 
 
 # aliases kept so old names still work
@@ -1951,19 +2132,20 @@ async def copy_confirm(context, chat_id, _w3, txh, name):
         await context.bot.send_message(chat_id, f"[{name}] not confirmed in 90s - check the explorer")
 
 
-async def copy_fire(context, chat_id, to, data, value):
-    _w3 = w3()
-    _sw = submit_w3()
-    await context.bot.send_message(chat_id, f"Minting from {len(STATE['wallets'])} wallets -> {to[:10]}..")
+async def copy_fire(context, chat_id, to, data, value, ck=None):
+    ck = (ck or ACTIVE_CHAIN).lower()
+    cn = (CHAINS.get(ck) or {}).get("name", ck)
+    exp = (CHAINS.get(ck) or chain_cfg())["explorer"]
+    await context.bot.send_message(
+        chat_id, f"Minting from {len(STATE['wallets'])} wallets on {cn} -> {to[:10]}..")
 
     async def one(wal):
         try:
             cd = copy_wallet_calldata(to, data, wal)
-            tx = await run_blocking(build_custom_tx, _w3, wal, to, cd, value)
-            raw = sign_wallet(_w3, wal, tx)
-            txh = await run_blocking(do_send, _sw, raw)
-            await context.bot.send_message(chat_id, f"[{wal['name']}] minting.. SENT {txh}\n{EXPLORER}/tx/{txh}")
-            asyncio.create_task(copy_confirm(context, chat_id, _w3, txh, wal["name"]))
+            txh = await send_ck(wal, ck, to, cd, value)
+            _cw3, _ = wallet_rpc_ck(wal, ck)
+            await context.bot.send_message(chat_id, f"[{wal['name']}] minting.. SENT {txh}\n{exp}/tx/{txh}")
+            asyncio.create_task(copy_confirm(context, chat_id, _cw3, txh, wal["name"]))
         except Exception as e:
             return f"{wal['name']}: {safe(e, 60)}"
         return None
@@ -1976,49 +2158,79 @@ async def copy_fire(context, chat_id, to, data, value):
             f"{len(fails)}/{len(STATE['wallets'])} wallets failed - {safe(head, 90)}")
 
 
-async def _copy_loop(context, chat_id, target, interval):
+# aliases - one implementation, two historical names
+load_copywatch = load_watchlist
+save_copywatch = save_watchlist
+
+
+async def _chain_watch_loop(context, chat_id, chain_key, interval=2.0):
+    """ONE loop per chain, watching every tracked wallet in a single log query."""
+    _w3 = watch_w3(chain_key)
+    cname = (CHAINS.get(chain_key) or {}).get("name", chain_key)
     seen = set()
-    _w3 = watch_w3()
-    try:
-        last_block = await run_blocking(lambda: _w3.eth.block_number)
-    except Exception:
-        last_block = None
     backoff = interval
-    await context.bot.send_message(
-        chat_id,
-        f"Copy-mint watching {copy_label(target)} ({target})\n"
-        "Alerts on ANY mint or purchase - OpenSea, custom website contracts, launchpads, "
-        "ERC721 or ERC1155. Detected from transfer logs, not function names. /cancelcopy to stop."
-    )
+    try:
+        last = await run_blocking(lambda: _w3.eth.block_number)
+    except Exception:
+        last = None
     while True:
+        targets = list((STATE.get("copy_targets") or {}).keys())
+        if not targets:
+            await asyncio.sleep(interval)
+            continue
         try:
             head = await run_blocking(lambda: _w3.eth.block_number)
-            if last_block is None:
-                last_block = head
-            if head > last_block:
-                start = last_block + 1
-                if head - start > 25:
-                    start = head - 25
-                acqs = await run_blocking(scan_acquisitions, _w3, target, start, head)
-                last_block = head
-                for txh, acq in acqs.items():
-                    if txh in seen:
+            if last is None:
+                last = head
+            if head > last:
+                start_b = last + 1
+                if head - start_b > 40:
+                    start_b = head - 40
+                acqs = await run_blocking(scan_many, _w3, targets, start_b, head)
+                last = head
+                for (txh, tgt), acq in acqs.items():
+                    if (txh, tgt) in seen:
                         continue
-                    seen.add(txh)
+                    seen.add((txh, tgt))
                     spawn(context, chat_id,
-                          report_acquisition(context, chat_id, target, txh, acq, _w3),
-                          f"{copy_label(target)} alert")
-                if len(seen) > 500:                 # keep memory bounded
-                    seen = set(list(seen)[-200:])
+                          report_acquisition(context, chat_id, tgt, txh, acq, _w3, chain_key),
+                          f"{copy_label(tgt)} on {cname}")
+                if len(seen) > 800:
+                    seen = set(list(seen)[-300:])
             backoff = interval
         except Exception as e:
             if is_rate_limit(e):
-                backoff = min(backoff * 2 if backoff else interval, 15.0)
+                backoff = min(backoff * 2 if backoff else interval, 20.0)
                 await asyncio.sleep(backoff)
                 continue
             await asyncio.sleep(interval)
             continue
-        await asyncio.sleep(interval)          # <-- pace the loop (was missing)
+        await asyncio.sleep(interval)
+
+
+def watchers_running():
+    """Chain watchers that are currently alive."""
+    return {k: t for k, t in STATE.get("copy_tasks", {}).items() if t and not t.done()}
+
+
+def ensure_watchers(context, chat_id, force=False):
+    """Make sure one watcher is running per chain. Idempotent.
+    Respects /cancelcopy unless force=True (an explicit user action)."""
+    if STATE.get("copy_paused") and not force:
+        return []
+    STATE["copy_paused"] = False
+    started = []
+    for ck in WATCH_CHAINS:
+        if ck not in CHAINS:
+            continue
+        t = STATE["copy_tasks"].get(ck)
+        if t and not t.done():
+            continue
+        STATE["copy_tasks"][ck] = asyncio.create_task(
+            _chain_watch_loop(context, chat_id, ck))
+        started.append(CHAINS[ck]["name"])
+    return started
+
 
 async def cb_handler(update, context):
     q = update.callback_query
@@ -2047,7 +2259,8 @@ async def cb_handler(update, context):
             await q.edit_message_text(f"Approved: {pend['desc']} - minting...")
         except Exception:
             pass
-        await copy_fire(context, q.message.chat_id, pend["to"], pend["data"], pend["value"])
+        await copy_fire(context, q.message.chat_id, pend["to"], pend["data"],
+                        pend["value"], pend.get("ck"))
         return
     if len(parts) == 2 and parts[0] == "act":
         a = parts[1]
@@ -2118,9 +2331,8 @@ async def cb_handler(update, context):
             return
         if len(parts) == 3 and parts[1] == "rm":
             addr = parts[2]
-            t = STATE["copy_tasks"].pop(addr, None)
-            if t and not t.done():
-                t.cancel()
+            (STATE.get("copy_targets") or {}).pop(addr, None)
+            save_copywatch()
             try:
                 await q.edit_message_text(copywatch_text(), reply_markup=copywatch_kb())
             except Exception:
@@ -2129,47 +2341,84 @@ async def cb_handler(update, context):
 
 
 def copy_label(addr):
-    """Friendly name for a tracked wallet, falling back to a short address."""
-    lbl = STATE["copy_labels"].get(addr)
+    lbl = (STATE.get("copy_targets") or {}).get(addr) or (STATE.get("copy_labels") or {}).get(addr)
     return lbl if lbl else f"{addr[:8]}..{addr[-4:]}"
 
 
-async def add_copy_target(context, chat_id, target, interval=1.0, label=None):
-    existing = STATE["copy_tasks"].get(target)
-    if existing and not existing.done():
-        await context.bot.send_message(chat_id, f"Already tracking {target[:10]}..")
-        return
-    if label:
-        STATE["copy_labels"][target] = label
-    STATE["copy_tasks"][target] = asyncio.create_task(_copy_loop(context, chat_id, target, interval))
-    await context.bot.send_message(
-        chat_id,
-        f"Added to copy watchlist: {copy_label(target)}\n{target}\n"
-        f"Now tracking {len(STATE['copy_tasks'])} wallet(s). /copywatch to manage.")
+async def add_copy_targets(context, chat_id, pairs):
+    """pairs = [(address, label_or_None)]. Watched on every chain automatically."""
+    added, dupes = [], []
+    for addr, label in pairs:
+        if addr in STATE["copy_targets"]:
+            dupes.append(addr)
+            if label:
+                STATE["copy_targets"][addr] = label
+            continue
+        STATE["copy_targets"][addr] = label
+        added.append(addr)
+    save_watchlist()
+    started = ensure_watchers(context, chat_id, force=True)
+    chains = ", ".join(CHAINS[c]["name"] for c in WATCH_CHAINS if c in CHAINS)
+    lines = []
+    if added:
+        lines.append(f"Added {len(added)} wallet(s) to the watchlist:")
+        for a in added[:12]:
+            lines.append(f"  {copy_label(a)}  {a}")
+        if len(added) > 12:
+            lines.append(f"  ...and {len(added)-12} more")
+    if dupes:
+        lines.append(f"({len(dupes)} already tracked)")
+    lines.append(f"\nTracking {len(STATE['copy_targets'])} wallet(s) on: {chains}")
+    lines.append("Saved to disk - survives restarts. /copywatch to manage.")
+    if started:
+        lines.append(f"Watchers started: {', '.join(started)}")
+    await context.bot.send_message(chat_id, "\n".join(lines))
+
+
+def parse_addresses(text):
+    """Pull every address out of a blob. Supports '0xabc=name' or '0xabc name'."""
+    out = []
+    for chunk in re.split(r"[\n,]+", text or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.search(r"0x[a-fA-F0-9]{40}", chunk)
+        if not m:
+            continue
+        addr = Web3.to_checksum_address(m.group(0))
+        rest = (chunk[:m.start()] + " " + chunk[m.end():]).replace("=", " ").strip()
+        out.append((addr, rest or None))
+    return out
 
 
 def copywatch_text():
-    active = {a: t for a, t in STATE["copy_tasks"].items() if t and not t.done()}
-    if not active:
-        return "Copy-mint watchlist: empty.\nTap + Add below, or send /copy 0xADDRESS."
-    lines = [f"Copy-mint watchlist ({len(active)}):"]
-    for a in active:
-        lbl = STATE["copy_labels"].get(a)
-        lines.append(f" - {lbl}\n   {a}" if lbl else f" - {a}")
+    tg = STATE.get("copy_targets", {})
+    chains = ", ".join(CHAINS[c]["name"] for c in WATCH_CHAINS if c in CHAINS)
+    live = len(watchers_running())
+    if not tg:
+        return ("Copy watchlist: empty.\n"
+                f"Chains watched automatically: {chains}\n"
+                "Add with /copy 0xADDR name  or  /copyadd (paste many at once).")
+    lines = [f"Copy watchlist ({len(tg)} wallets) | watchers live: {live}",
+             f"Chains: {chains}", ""]
+    for i, (a, l) in enumerate(list(tg.items())[:40], 1):
+        lines.append(f"{i}. {l or '(unnamed)'}  {a[:10]}..{a[-4:]}")
+    if len(tg) > 40:
+        lines.append(f"...and {len(tg)-40} more")
     return "\n".join(lines)
 
 
 def copywatch_kb():
     rows = []
-    for a, t in STATE["copy_tasks"].items():
-        if t and not t.done():
-            rows.append([InlineKeyboardButton(f"Remove {copy_label(a)}", callback_data=f"cw|rm|{a}")])
-    rows.append([InlineKeyboardButton("+ Add wallet", callback_data="cw|add")])
+    for a, l in list(STATE.get("copy_targets", {}).items())[:8]:
+        rows.append([InlineKeyboardButton(f"Remove {l or a[:10]}", callback_data=f"cw|rm|{a}")])
+    rows.append([InlineKeyboardButton("+ Add wallet(s)", callback_data="cw|add")])
     return InlineKeyboardMarkup(rows)
 
 
 @owner_only
 async def copywatch_cmd(update, context):
+    ensure_watchers(context, update.effective_chat.id, force=True)
     await update.effective_message.reply_text(copywatch_text(), reply_markup=copywatch_kb())
 
 
@@ -2267,9 +2516,9 @@ def os_collection_by_contract(session, chain_ident, address):
     return c or None
 
 
-def enrich_collection(_w3, collection):
+def enrich_collection(_w3, collection, chain_key=None):
     """Best-effort collection card: name, verified, floor, socials, OS link."""
-    c = chain_cfg()
+    c = CHAINS.get(chain_key) or chain_cfg()
     info = {"address": collection, "name": None, "verified": None, "slug": None,
             "floor": None, "twitter": None, "discord": None, "website": None,
             "supply": None, "owners": None, "os_url": f"https://opensea.io/assets/{c['os_chain']}/{collection}"}
@@ -2307,8 +2556,8 @@ def enrich_collection(_w3, collection):
     return info
 
 
-def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="ETH"):
-    c = chain_cfg()
+def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="ETH", chain_key=None):
+    c = CHAINS.get(chain_key) or chain_cfg()
     verb = "SWEPT" if count > 1 else "BOUGHT"
     L = [f"{label} {verb} {count}x  {info['name'] or 'Unknown collection'}"]
     L.append("")
@@ -2349,8 +2598,8 @@ def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="E
     return "\n".join(L)
 
 
-def sweep_buttons(info, tx_hash=None):
-    c = chain_cfg()
+def sweep_buttons(info, tx_hash=None, chain_key=None):
+    c = CHAINS.get(chain_key) or chain_cfg()
     rows = [[InlineKeyboardButton("Open collection on OpenSea", url=info["os_url"])]]
     extra = []
     if info.get("website"):
@@ -2371,6 +2620,74 @@ ZERO_TOPIC = "0x" + "00" * 32
 
 def _pad_addr(a):
     return "0x" + "0" * 24 + a.lower().replace("0x", "")
+
+
+def scan_acquisitions_multi(_w3, targets, from_block, to_block):
+    """Scan for NFTs landing in ANY tracked wallet using a single log query per
+    block range (topic filters accept an address list). This is what makes
+    watching dozens of wallets on several chains affordable."""
+    if not targets:
+        return {}
+    tmap = {_pad_addr(a).lower(): a for a in targets}
+    topic_list = list(tmap.keys())
+    out = {}
+    try:
+        logs = _w3.eth.get_logs({
+            "fromBlock": from_block, "toBlock": to_block,
+            "topics": [ERC20_TRANSFER, None, topic_list],
+        })
+    except Exception:
+        logs = []
+    for lg in logs:
+        topics = lg.get("topics") or []
+        if len(topics) != 4:
+            continue
+        to_t = (topics[2].hex() if hasattr(topics[2], "hex") else str(topics[2])).lower()
+        if not to_t.startswith("0x"):
+            to_t = "0x" + to_t
+        owner = tmap.get(to_t)
+        if not owner:
+            continue
+        h = lg.get("transactionHash")
+        h = h.hex() if hasattr(h, "hex") else str(h)
+        if not h.startswith("0x"):
+            h = "0x" + h
+        frm = _topic_addr(topics[1])
+        coll = Web3.to_checksum_address(lg["address"])
+        tid = int((topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])), 16)
+        e = out.setdefault(h, {"collection": coll, "count": 0, "ids": [],
+                               "is_mint": int(frm, 16) == 0, "target": owner})
+        if e["collection"] == coll:
+            e["count"] += 1
+            e["ids"].append(tid)
+    for topic in (ERC1155_SINGLE, ERC1155_BATCH):
+        try:
+            logs = _w3.eth.get_logs({
+                "fromBlock": from_block, "toBlock": to_block,
+                "topics": [topic, None, None, topic_list],
+            })
+        except Exception:
+            continue
+        for lg in logs:
+            topics = lg.get("topics") or []
+            if len(topics) < 4:
+                continue
+            to_t = (topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])).lower()
+            if not to_t.startswith("0x"):
+                to_t = "0x" + to_t
+            owner = tmap.get(to_t)
+            if not owner:
+                continue
+            h = lg.get("transactionHash")
+            h = h.hex() if hasattr(h, "hex") else str(h)
+            if not h.startswith("0x"):
+                h = "0x" + h
+            frm = _topic_addr(topics[2])
+            coll = Web3.to_checksum_address(lg["address"])
+            e = out.setdefault(h, {"collection": coll, "count": 0, "ids": [],
+                                   "is_mint": int(frm, 16) == 0, "target": owner})
+            e["count"] += 1
+    return out
 
 
 def scan_acquisitions(_w3, target, from_block, to_block):
@@ -2430,7 +2747,76 @@ def scan_acquisitions(_w3, target, from_block, to_block):
     return out
 
 
-async def report_acquisition(context, chat_id, target, txh, acq, _w3):
+def scan_many(_w3, targets, from_block, to_block):
+    """One eth_getLogs covering EVERY tracked wallet (topics accept an OR-list).
+    Scales to hundreds of wallets at the cost of a single query per chain."""
+    if not targets:
+        return {}
+    pad = {_pad_addr(a).lower(): a for a in targets}
+    out = {}
+
+    def add(h, coll, target, is_mint, tid=None):
+        k = (h, target)
+        e = out.setdefault(k, {"collection": coll, "count": 0, "ids": [],
+                               "is_mint": is_mint, "target": target})
+        if e["collection"] == coll:
+            e["count"] += 1
+            if tid is not None:
+                e["ids"].append(tid)
+
+    try:
+        logs = _w3.eth.get_logs({
+            "fromBlock": from_block, "toBlock": to_block,
+            "topics": [ERC20_TRANSFER, None, list(pad.keys())],
+        })
+    except Exception:
+        logs = []
+    for lg in logs:
+        topics = lg.get("topics") or []
+        if len(topics) != 4:
+            continue
+        h = lg.get("transactionHash")
+        h = h.hex() if hasattr(h, "hex") else str(h)
+        if not h.startswith("0x"):
+            h = "0x" + h
+        to_key = (topics[2].hex() if hasattr(topics[2], "hex") else str(topics[2])).lower()
+        if not to_key.startswith("0x"):
+            to_key = "0x" + to_key
+        tgt = pad.get(to_key)
+        if not tgt:
+            continue
+        frm = _topic_addr(topics[1])
+        tid = int((topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])), 16)
+        add(h, Web3.to_checksum_address(lg["address"]), tgt, int(frm, 16) == 0, tid)
+
+    for topic in (ERC1155_SINGLE, ERC1155_BATCH):
+        try:
+            logs = _w3.eth.get_logs({
+                "fromBlock": from_block, "toBlock": to_block,
+                "topics": [topic, None, None, list(pad.keys())],
+            })
+        except Exception:
+            continue
+        for lg in logs:
+            topics = lg.get("topics") or []
+            if len(topics) < 4:
+                continue
+            h = lg.get("transactionHash")
+            h = h.hex() if hasattr(h, "hex") else str(h)
+            if not h.startswith("0x"):
+                h = "0x" + h
+            to_key = (topics[3].hex() if hasattr(topics[3], "hex") else str(topics[3])).lower()
+            if not to_key.startswith("0x"):
+                to_key = "0x" + to_key
+            tgt = pad.get(to_key)
+            if not tgt:
+                continue
+            frm = _topic_addr(topics[2])
+            add(h, Web3.to_checksum_address(lg["address"]), tgt, int(frm, 16) == 0)
+    return out
+
+
+async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=None):
     """Alert on any mint/purchase - and for MINTS, replicate it across your wallets.
     Free mints fire immediately; paid mints ask for approval; signature-gated
     whitelist mints can't be copied so we say so (and fall back to a live public stage)."""
@@ -2456,20 +2842,22 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3):
             except Exception:
                 pass
 
-        info = await run_blocking(enrich_collection, _w3, acq["collection"])
+        info = await run_blocking(enrich_collection, _w3, acq["collection"], chain_key)
         STATE["last_sweep"] = {"slug": info.get("slug"), "collection": acq["collection"]}
 
         body = format_trade_alert(copy_label(target), info, acq["count"], spent,
-                                  acq["ids"], paid_in)
+                                  acq["ids"], paid_in, chain_key)
         if acq["is_mint"]:
             rest = body.split("\n", 1)[1] if "\n" in body else body
             head = f"{copy_label(target)} MINTED {acq['count']}x  {info['name'] or 'Unknown'}"
             body = head + "\n" + rest + ("\n(FREE mint)" if spent == 0 else "")
-        await context.bot.send_message(chat_id, body, reply_markup=sweep_buttons(info, txh))
+        await context.bot.send_message(chat_id, body,
+                                       reply_markup=sweep_buttons(info, txh, chain_key))
 
         # ---------- copy-mint: only for mints, only if we can replay the call ----------
         if not acq["is_mint"] or not to or len(data) < 10 or not STATE["wallets"]:
             return
+        ck = (chain_key or ACTIVE_CHAIN).lower()   # copy on the chain it happened on
         to = Web3.to_checksum_address(to)
 
         if is_signed_mint(data):
@@ -2492,12 +2880,12 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3):
                     await context.bot.send_message(
                         chat_id, "Their WL signature can't be copied - but the PUBLIC stage "
                                  "is live and free. Minting that for all wallets.")
-                    asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub, 0))
+                    asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub, 0, ck))
                 else:
                     pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
                     pe = Decimal(price) / Decimal(10 ** 18)
                     STATE["pending"][pid] = {"to": SEADROP_ADDR, "data": pub, "value": price,
-                                             "desc": f"{pe} ETH public stage"}
+                                             "ck": ck, "desc": f"{pe} ETH public stage"}
                     kb = InlineKeyboardMarkup([[
                         InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
                         InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
@@ -2514,14 +2902,15 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3):
 
         if spent == 0:
             await context.bot.send_message(
-                chat_id, f"FREE mint - copying to your {len(STATE['wallets'])} wallets...")
-            asyncio.create_task(copy_fire(context, chat_id, to, data, 0))
+                chat_id, f"FREE mint on {(CHAINS.get(ck) or {}).get('name', ck)} - "
+                         f"copying to your {len(STATE['wallets'])} wallets...")
+            asyncio.create_task(copy_fire(context, chat_id, to, data, 0, ck))
         else:
             pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
             pe = Decimal(eth_val) / Decimal(10 ** 18)
             tot = pe * len(STATE["wallets"])
             STATE["pending"][pid] = {"to": to, "data": data, "value": eth_val,
-                                     "desc": f"{pe} ETH -> {to[:10]}.."}
+                                     "ck": ck, "desc": f"{pe} ETH -> {to[:10]}.."}
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
                 InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
@@ -2560,8 +2949,8 @@ async def copy_cmd(update, context):
     if not context.args:
         await update.effective_message.reply_text(
             "Usage: /copy 0xADDRESS [name]\n"
-            "e.g. /copy 0xabc... whale1\n"
-            "The name shows in alerts so you know whose mint it is. /rename to change it.")
+            "Watches ALL chains automatically (Ethereum, Ink, Robinhood).\n"
+            "Mass add: /copyadd 0xaaa 0xbbb:whale2 0xccc")
         return
     try:
         target = Web3.to_checksum_address(context.args[0])
@@ -2569,7 +2958,63 @@ async def copy_cmd(update, context):
         await update.effective_message.reply_text("Invalid address.")
         return
     label = " ".join(context.args[1:]).strip() or None
-    await add_copy_target(context, update.effective_chat.id, target, 1.0, label)
+    await add_copy_targets(context, update.effective_chat.id, [(target, label)])
+
+
+@owner_only
+async def copyadd_cmd(update, context):
+    """Mass add: /copyadd then many addresses (space / comma / newline separated).
+    Optional names: 0xabc=whale1 or '0xabc whale1'."""
+    blob = " ".join(context.args) if context.args else ""
+    if not blob:
+        STATE["awaiting_copy"] = True
+        await update.effective_message.reply_text(
+            "Paste your wallet list now - one per line, or separated by spaces/commas.\n"
+            "Optional names: 0xabc=whale1\n"
+            "Watched automatically on Ethereum, Ink and Robinhood. /cancel to abort.")
+        return
+    pairs = parse_addresses(blob)
+    if not pairs:
+        await update.effective_message.reply_text("No valid 0x addresses found.")
+        return
+    await add_copy_targets(context, update.effective_chat.id, pairs)
+
+
+@owner_only
+async def copyremove_cmd(update, context):
+    """/copyremove 0xADDR [0xADDR ...]  |  /copyremove all"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /copyremove 0xADDRESS [more...]   or   /copyremove all")
+        return
+    if context.args[0].lower() == "all":
+        n = len(STATE.get("copy_targets", {}))
+        STATE["copy_targets"] = {}
+        save_copywatch()
+        await update.effective_message.reply_text(f"Removed all {n} tracked wallet(s).")
+        return
+    removed, missing = [], []
+    for a, _ in parse_addresses(" ".join(context.args)):
+        if STATE.get("copy_targets", {}).pop(a, None) is not None:
+            removed.append(a)
+        else:
+            missing.append(a)
+    save_copywatch()
+    msg = []
+    if removed:
+        msg.append(f"Removed {len(removed)}: " + ", ".join(a[:10] + ".." for a in removed))
+    if missing:
+        msg.append(f"Not tracked: {len(missing)}")
+    msg.append(f"Now tracking {len(STATE.get('copy_targets', {}))} wallet(s).")
+    await update.effective_message.reply_text("\n".join(msg))
+
+
+@owner_only
+async def copyclear_cmd(update, context):
+    n = len(STATE.get("copy_targets", {}))
+    STATE["copy_targets"] = {}
+    save_watchlist()
+    await update.effective_message.reply_text(f"Cleared {n} wallet(s) from the watchlist.")
 
 
 @owner_only
@@ -2584,11 +3029,15 @@ async def rename_cmd(update, context):
         await update.effective_message.reply_text("Invalid address.")
         return
     name = " ".join(context.args[1:]).strip()
+    tgts = STATE.setdefault("copy_targets", {})
     if name == "-":
-        STATE["copy_labels"].pop(addr, None)
+        if addr in tgts:
+            tgts[addr] = ""
+        save_copywatch()
         await update.effective_message.reply_text(f"Name cleared for {addr[:10]}..")
         return
-    STATE["copy_labels"][addr] = name
+    tgts[addr] = name
+    save_copywatch()
     await update.effective_message.reply_text(f"Named {addr[:10]}.. as \"{name}\"")
 
 
@@ -2635,7 +3084,7 @@ async def mintloop_cmd(update, context):
             try:
                 tx = await run_blocking(build_wallet_tx, _w3, wal, nonce)
                 raw = sign_wallet(_w3, wal, tx)
-                await run_blocking(do_send, _sw, raw)
+                await send_raw_failover(wal, raw)
                 ok += 1
                 nonce += 1
             except Exception as e:
@@ -2676,9 +3125,16 @@ def os_parse_time(v):
         return None
 
 
-def os_stage_label(t):
-    return {"SIGNED_PRESALE": "WHITELIST", "MERKLE_PRESALE": "ALLOWLIST",
+def os_stage_label(k):
+    """k is 'TYPE#index'. Shows the phase number so multi-stage drops are readable."""
+    t, _, idx = str(k).partition("#")
+    base = {"SIGNED_PRESALE": "WHITELIST", "MERKLE_PRESALE": "ALLOWLIST",
             "PUBLIC_SALE": "PUBLIC"}.get(t, t)
+    return f"{base} #{idx}" if idx not in ("", "0") else base
+
+
+def stage_type_of(k):
+    return str(k).partition("#")[0]
 
 
 def os_ctx_buttons():
@@ -2701,7 +3157,7 @@ def os_ctx_buttons():
 async def os_autoload(update, context, slug):
     """Paste an OpenSea link -> log in, read stages + per-wallet eligibility, show buttons."""
     reply = update.effective_message.reply_text
-    _w3 = w3()
+    _w3 = watch_w3()                      # public rpc - keep private keys for minting
     try:
         chain_id = await run_blocking(lambda: _w3.eth.chain_id)
     except Exception:
@@ -2739,10 +3195,12 @@ async def os_autoload(update, context, slug):
         t = st.get("stageType")
         if not t:
             continue
-        stage_meta[t] = {
+        k = f"{t}#{st.get('stageIndex', 0)}"      # OG / WL / FCFS are all SIGNED_PRESALE
+        stage_meta[k] = {
             "start": os_parse_time(st.get("startTime")),
             "end": os_parse_time(st.get("endTime")),
             "index": st.get("stageIndex"),
+            "type": t,
         }
 
     async def elig(w):
@@ -2759,15 +3217,24 @@ async def os_autoload(update, context, slug):
         if err:
             errs.append(f"{name}: {err}")
         for s in stages:
-            t = s["type"]
-            elig_map.setdefault(t, []).append(name)
+            k = f"{s['type']}#{s.get('index', 0)}"
+            elig_map.setdefault(k, []).append(name)
             if s.get("price_wei") is not None:
-                price_map[t] = s["price_wei"]
+                price_map[k] = s["price_wei"]
             if s.get("max"):
-                max_map[t] = max(int(s["max"] or 0), max_map.get(t, 0))
+                max_map[k] = max(int(s["max"] or 0), max_map.get(k, 0))
+            stage_meta.setdefault(k, {"start": None, "end": None,
+                                      "index": s.get("index", 0), "type": s["type"]})
 
-    order = [t for t in ("SIGNED_PRESALE", "MERKLE_PRESALE", "PUBLIC_SALE") if t in elig_map]
-    order += [t for t in elig_map if t not in order]
+    def _rank(k):
+        t = k.split("#")[0]
+        base = {"SIGNED_PRESALE": 0, "MERKLE_PRESALE": 1, "PUBLIC_SALE": 2}.get(t, 3)
+        try:
+            return (base, int(k.split("#")[1]))
+        except Exception:
+            return (base, 0)
+
+    order = sorted(elig_map.keys(), key=_rank)
     STATE["os_ctx"] = {"slug": slug, "coll": coll, "elig": elig_map, "price": price_map,
                        "max": max_map, "meta": stage_meta, "order": order, "chain_id": chain_id}
 
@@ -2855,12 +3322,9 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
                     await asyncio.sleep(0.5)
             if action is None:
                 raise last or RuntimeError("no mint action")
-            await run_blocking(os_validate, action, coll, wal, stage_type, per, chain_id)
+            await run_blocking(os_validate, action, coll, wal, stage_type_of(stage_type), per, chain_id)
+            txh = await send_with_failover(wal, action["to"], action["data"], action["value"])
             _pw3, _ = wallet_rpc(wal)
-            tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
-                                    action["data"], action["value"])
-            raw = sign_wallet(_pw3, wal, tx)
-            txh = await run_blocking(do_send, _pw3, raw, narrow_targets(wal))
             await context.bot.send_message(chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, wal["name"]))
             STATE.setdefault("os_done", {})[wal["name"]] = True
@@ -2889,7 +3353,7 @@ async def os_prearm(context, chat_id, stage_type, per, wallets, coll, chain_id, 
                 s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
                 STATE["os_sessions"][wal["name"]] = s
             action = await os_retry(os_mint_action, s, coll, wal, per, label=wal["name"])
-            await run_blocking(os_validate, action, coll, wal, stage_type, per, chain_id)
+            await run_blocking(os_validate, action, coll, wal, stage_type_of(stage_type), per, chain_id)
             _pw3, _ = wallet_rpc(wal)
             tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
                                     action["data"], action["value"])
@@ -2906,10 +3370,12 @@ async def os_blast_armed(context, chat_id, armed):
     """Broadcast every pre-signed tx at once - this is the zero-latency path."""
     async def fire(name, pair):
         raw, _pw3 = pair
+        wal = next((w for w in STATE["wallets"] if w["name"] == name), None)
         try:
-            wal = next((w for w in STATE["wallets"] if w["name"] == name), None)
-            txh = await run_blocking(do_send, _pw3, raw,
-                                     narrow_targets(wal) if wal else None)
+            if wal is not None:
+                txh = await send_raw_failover(wal, raw)
+            else:
+                txh = await run_blocking(do_send, _pw3, raw)
             await context.bot.send_message(chat_id, f"[{name}] SENT {txh}\n{EXPLORER}/tx/{txh}")
             asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, name))
             return None
@@ -3091,7 +3557,7 @@ async def osmint_cmd(update, context):
         await update.effective_message.reply_text("Run /oscheck <collection> first.")
         return
     stage_type = (context.args[0].upper() if context.args else "PUBLIC_SALE")
-    if stage_type not in STAGE_SELECTOR:
+    if stage_type_of(stage_type) not in STAGE_SELECTOR:
         await update.effective_message.reply_text(
             "Stage must be one of: SIGNED_PRESALE, MERKLE_PRESALE, PUBLIC_SALE")
         return
@@ -3125,17 +3591,18 @@ async def osmint_cmd(update, context):
                 s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
                 STATE["os_sessions"][wal["name"]] = s
             action = await os_retry(os_mint_action, s, coll, wal, qty, label=wal["name"])
-            await run_blocking(os_validate, action, coll, wal, stage_type, qty, chain_id)
+            await run_blocking(os_validate, action, coll, wal,
+                                stage_type_of(stage_type), qty, chain_id)
+            txh = await send_with_failover(wal, action["to"], action["data"], action["value"])
             _pw3 = wallet_w3(wal)
-            tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
-                                    action["data"], action["value"])
-            raw = sign_wallet(_pw3, wal, tx)
-            txh = await run_blocking(do_send, _pw3, raw)
             asyncio.create_task(_confirm(update, _pw3, txh, wal["name"]))
             return f"[{wal['name']}] SENT {txh[:20]}.."
         except Exception as e:
+            if is_rate_limit(e):
+                return (f"[{wal['name']}] all RPC endpoints rate-limited/exhausted "
+                        f"- check /rpcstatus")
             if is_os_rate_limited(e):
-                return f"[{wal['name']}] OpenSea rate limited - retry /osmint"
+                return f"[{wal['name']}] OpenSea rate limited - retry"
             return f"[{wal['name']}] {safe(e, 70)}"
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
@@ -3407,6 +3874,54 @@ async def do_sweep_quote(reply, slug, n):
 
 
 @owner_only
+async def copytest_cmd(update, context):
+    """/copytest 0xADDR [blocks] [chain] - scan recent blocks and show what the
+    watcher WOULD have alerted on. Proves detection works without waiting."""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /copytest 0xADDRESS [blocks] [chain]\n"
+            "Scans recent blocks for that wallet's mints/buys so you can confirm "
+            "copy-watching is actually working.")
+        return
+    try:
+        target = Web3.to_checksum_address(context.args[0])
+    except Exception:
+        await update.effective_message.reply_text("Invalid address.")
+        return
+    blocks = 200
+    chain_key = ACTIVE_CHAIN
+    for a in context.args[1:]:
+        if a.lower() in CHAINS:
+            chain_key = a.lower()
+        else:
+            try:
+                blocks = max(1, min(2000, int(a)))
+            except ValueError:
+                pass
+    _w3 = watch_w3(chain_key)
+    cn = CHAINS[chain_key]["name"]
+    await update.effective_message.reply_text(
+        f"Scanning last {blocks} blocks on {cn} for {target[:10]}.. (public RPC)")
+    try:
+        head = await run_blocking(lambda: _w3.eth.block_number)
+        acqs = await run_blocking(scan_acquisitions, _w3, target, max(0, head - blocks), head)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Scan failed: {safe(e, 110)}")
+        return
+    if not acqs:
+        await update.effective_message.reply_text(
+            f"No NFT mints or buys by that wallet in the last {blocks} blocks.\n"
+            "Detection is working - the wallet simply hasn't acquired anything recently.")
+        return
+    lines = [f"Found {len(acqs)} acquisition tx:"]
+    for txh, a in list(acqs.items())[:10]:
+        kind = "MINT" if a["is_mint"] else "BUY"
+        lines.append(f"  {kind} {a['count']}x {a['collection'][:10]}..  {txh[:14]}..")
+    lines.append("\nThese are what copy-mint would have fired on.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+@owner_only
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
     lines = [f"RPC pool: {n} endpoint(s), {len(healthy_endpoints())} healthy | "
@@ -3426,8 +3941,12 @@ async def rpcstatus_cmd(update, context):
             mark_rate_limited(url, 30) if is_rate_limit(e) else None
             return f"[{i+1}] DOWN {safe(e, 40)} | ...{tag}"
 
-    res = await asyncio.gather(*[chk(i) for i in range(n)])
-    await update.effective_message.reply_text("\n".join(lines + list(res)))
+    res = []
+    for i in range(n):
+        res.append(await chk(i))
+        await asyncio.sleep(0.25)      # stagger: don't self-trigger the shared limit
+    lines.append("")
+    await update.effective_message.reply_text("\n".join(lines + res))
 
 
 async def guard_msg(update, context):
@@ -3435,6 +3954,9 @@ async def guard_msg(update, context):
         return
     if (not OWNER_ID) or (not update.effective_user) or update.effective_user.id != OWNER_ID:
         return
+    if STATE.get("copy_targets") and not STATE.get("copy_paused") and not any(
+            t and not t.done() for t in STATE["copy_tasks"].values()):
+        ensure_watchers(context, update.effective_chat.id)   # resume after a restart
     text = update.message.text.strip()
     if PK_PATTERN.search(text):
         await update.message.reply_text(
@@ -3442,12 +3964,15 @@ async def guard_msg(update, context):
             "Keys go in wallets.json on your server, never in chat.")
         return
     if STATE.get("awaiting_copy"):
-        m = re.search(r"0x[a-fA-F0-9]{40}", text)
-        if not m:
-            await update.message.reply_text("Not a valid address. Paste a 0x wallet address, or /cancel.")
+        pairs = parse_addresses(text)
+        if not pairs:
+            await update.message.reply_text("No valid 0x addresses there. Paste them, or /cancel.")
             return
         STATE["awaiting_copy"] = False
-        await add_copy_target(context, update.effective_chat.id, Web3.to_checksum_address(m.group(0)))
+        await add_copy_targets(context, update.effective_chat.id, pairs)
+        return
+    if text.count("0x") >= 3 and len(parse_addresses(text)) >= 3:
+        await add_copy_targets(context, update.effective_chat.id, parse_addresses(text))
         return
     _s = None
     if "opensea.io/collection/" in text:
@@ -3465,6 +3990,7 @@ async def guard_msg(update, context):
 def main():
     if not BOT_TOKEN or not OWNER_ID:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN or AUTHORIZED_USER_ID - see .env.example")
+    STATE["copy_targets"] = load_watchlist()
     try:
         STATE["wallets"] = load_wallets()
     except Exception as e:
@@ -3482,10 +4008,11 @@ def main():
         ("newwallet", newwallet_cmd), ("importwallet", importwallet_cmd),
         ("setgas", setgas_cmd), ("copy", copy_cmd),
         ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
-        ("copywatch", copywatch_cmd), ("rpcstatus", rpcstatus_cmd),
+        ("copywatch", copywatch_cmd), ("copyadd", copyadd_cmd),
+        ("copyclear", copyclear_cmd), ("copyremove", copyremove_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("chain", chain_cmd), ("sweep", sweep_cmd), ("setproof", setproof_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("chain", chain_cmd), ("copytest", copytest_cmd), ("sweep", sweep_cmd), ("setproof", setproof_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(cb_handler))
@@ -3495,6 +4022,8 @@ def main():
         use_chain(ACTIVE_CHAIN)
     except Exception as e:
         log.warning("chain init: %s", e)
+    log.info("Watchlist: %d wallet(s) restored from %s",
+             len(STATE["copy_targets"]), COPYWATCH_FILE)
     log.info("Bot up. owner=%s chain=%s wallets=%d endpoints=%d",
              OWNER_ID, CHAIN_ID, len(STATE["wallets"]), len(RPC_POOL))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

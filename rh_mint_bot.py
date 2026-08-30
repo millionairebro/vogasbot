@@ -2232,12 +2232,44 @@ def ensure_watchers(context, chat_id, force=False):
     return started
 
 
+class _CbReply:
+    """A reply target backed by bot.send_message, so it works even when the
+    original message is gone."""
+    def __init__(self, bot, chat_id):
+        self._bot = bot
+        self.chat_id = chat_id
+
+    async def reply_text(self, text, **kw):
+        return await self._bot.send_message(self.chat_id, text, **kw)
+
+
+class _CbUpdate:
+    """Wraps a callback so command handlers can reply even when the original
+    message is inaccessible (Telegram does this for messages older than 48h)."""
+    def __init__(self, update, context, chat_id):
+        m = _CbReply(context.bot, chat_id)
+        self.effective_message = m
+        self.message = m
+        self.effective_chat = type("C", (), {"id": chat_id})()
+        self.effective_user = getattr(update, "effective_user", None)
+        self.callback_query = getattr(update, "callback_query", None)
+
+
 async def cb_handler(update, context):
     q = update.callback_query
     if not q:
         return
     await q.answer()
     if (not OWNER_ID) or (not q.from_user) or q.from_user.id != OWNER_ID:
+        return
+    if q.message is None:
+        try:
+            await context.bot.send_message(
+                update.effective_user.id,
+                "That button's message is too old for Telegram to reply to. "
+                "Re-run the command or paste the collection link again.")
+        except Exception:
+            pass
         return
     parts = (q.data or "").split("|")
     if len(parts) == 3 and parts[0] == "cp":
@@ -2264,14 +2296,15 @@ async def cb_handler(update, context):
         return
     if len(parts) == 2 and parts[0] == "act":
         a = parts[1]
+        u2 = _CbUpdate(update, context, q.message.chat_id)
         if a == "sim":
-            await simall_cmd(update, context)
+            await simall_cmd(u2, context)
         elif a == "arm":
-            await armall_cmd(update, context)
+            await armall_cmd(u2, context)
         elif a == "mint":
-            await mintall_cmd(update, context)
+            await mintall_cmd(u2, context)
         elif a == "auto":
-            await autoall_cmd(update, context)
+            await autoall_cmd(u2, context)
         return
     if parts[0] in ("sw", "swx"):
         return
@@ -2304,7 +2337,8 @@ async def cb_handler(update, context):
                     "Nothing loaded (bot restarted). Paste the OpenSea link again.")
                 return
             STATE["os_sessions"] = {}
-            await os_autoload(update, context, ctx["slug"])
+            await os_autoload(_CbUpdate(update, context, q.message.chat_id),
+                              context, ctx["slug"])
             return
         if act == "m":
             await context.bot.send_message(

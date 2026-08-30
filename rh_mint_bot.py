@@ -2112,6 +2112,34 @@ def format_mint(info):
     return "\n".join(lines)
 
 
+# Calls that can move YOUR assets. Never replayed from your wallets, no matter
+# what a watched wallet appears to have done.
+DANGEROUS_SIGS = [
+    "transferFrom(address,address,uint256)",
+    "safeTransferFrom(address,address,uint256)",
+    "safeTransferFrom(address,address,uint256,bytes)",
+    "safeTransferFrom(address,address,uint256,uint256,bytes)",
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+    "transfer(address,uint256)",
+    "approve(address,uint256)",
+    "setApprovalForAll(address,bool)",
+    "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+    "increaseAllowance(address,uint256)",
+    "withdraw(uint256)",
+    "execute(bytes,bytes[],uint256)",
+    "multicall(bytes[])",
+    "delegate(address)",
+]
+DANGEROUS_SELECTORS = {"0x" + Web3.keccak(text=s)[:4].hex().replace("0x", "").lower()
+                       for s in DANGEROUS_SIGS}
+
+
+def is_dangerous_call(data):
+    if not data or len(data) < 10:
+        return False
+    return ("0x" + data[2:10].lower()) in DANGEROUS_SELECTORS
+
+
 def copy_wallet_calldata(to, data, wal):
     # if the target used OpenSea SeaDrop mintPublic, rebuild with OUR wallet as minter
     body = data[2:] if data.startswith("0x") else data
@@ -2855,10 +2883,12 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
     Free mints fire immediately; paid mints ask for approval; signature-gated
     whitelist mints can't be copied so we say so (and fall back to a live public stage)."""
     try:
-        data, to, eth_val = "0x", None, 0
+        data, to, eth_val, sender = "0x", None, 0, None
         try:
             tx = await run_blocking(_w3.eth.get_transaction, txh)
             eth_val = int(tx.get("value") or 0)
+            _f = tx.get("from")
+            sender = Web3.to_checksum_address(_f) if _f else None
             raw_in = tx.get("input")
             data = raw_in.hex() if hasattr(raw_in, "hex") else (raw_in or "0x")
             if not data.startswith("0x"):
@@ -2881,15 +2911,36 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
 
         body = format_trade_alert(copy_label(target), info, acq["count"], spent,
                                   acq["ids"], paid_in, chain_key)
+        _self_sent = bool(sender and target and sender.lower() == target.lower())
         if acq["is_mint"]:
             rest = body.split("\n", 1)[1] if "\n" in body else body
-            head = f"{copy_label(target)} MINTED {acq['count']}x  {info['name'] or 'Unknown'}"
+            verb = "MINTED" if _self_sent else "RECEIVED (airdrop)"
+            head = f"{copy_label(target)} {verb} {acq['count']}x  {info['name'] or 'Unknown'}"
             body = head + "\n" + rest + ("\n(FREE mint)" if spent == 0 else "")
         await context.bot.send_message(chat_id, body,
                                        reply_markup=sweep_buttons(info, txh, chain_key))
 
-        # ---------- copy-mint: only for mints, only if we can replay the call ----------
+        # ---------- copy-mint: strict safety gate ----------
         if not acq["is_mint"] or not to or len(data) < 10 or not STATE["wallets"]:
+            return
+
+        # (1) The tracked wallet must have SENT the transaction. A scammer can mint
+        #     or airdrop straight into their wallet, and any contract can emit a fake
+        #     Transfer log - neither is something we should ever replay.
+        if not sender or sender.lower() != target.lower():
+            await context.bot.send_message(
+                chat_id,
+                f"Not copying: {copy_label(target)} RECEIVED this (sent by "
+                f"{(sender or 'unknown')[:10]}..), they didn't mint it.\n"
+                "Airdrops and mint-to-victim scams are ignored on purpose.")
+            return
+
+        # (2) Never replay a call that can move assets out of your wallets.
+        if is_dangerous_call(data):
+            await context.bot.send_message(
+                chat_id,
+                f"BLOCKED for safety: that transaction calls {data[:10]} "
+                "(a transfer/approval-type function), not a mint. Not replaying it.")
             return
         ck = (chain_key or ACTIVE_CHAIN).lower()   # copy on the chain it happened on
         to = Web3.to_checksum_address(to)

@@ -3801,7 +3801,6 @@ async def osmint_cmd(update, context):
     await update.effective_message.reply_text("\n".join([f"OS mint ({stage_type}):"] + list(res)))
 
 
-@owner_only
 async def warm_sessions_bg(app):
     """Log wallets into OpenSea on startup so the first eligibility check is fast."""
     await asyncio.sleep(5)

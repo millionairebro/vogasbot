@@ -415,14 +415,14 @@ def narrow_targets(wal):
     return out
 
 
-async def send_with_failover(wal, to, data, value, tries=3):
+async def send_with_failover(wal, to, data, value, tries=3, nonce=None):
     """Build, sign and send for one wallet. If its endpoint is rate-limited or dead,
     mark it cooling and retry on a healthy one instead of just failing."""
     last = None
     for _ in range(max(1, tries)):
         _w3, url = wallet_rpc(wal)
         try:
-            tx = await run_blocking(build_custom_tx, _w3, wal, to, data, value)
+            tx = await run_blocking(build_custom_tx, _w3, wal, to, data, value, nonce)
             raw = sign_wallet(_w3, wal, tx)
             return await run_blocking(do_send, _w3, raw, narrow_targets(wal))
         except Exception as e:
@@ -890,6 +890,23 @@ OS_APP_ID = "os2-web"
 OS_CONCURRENCY = int(os.environ.get("OS_CONCURRENCY", "2") or "2")
 OS_DELAY = float(os.environ.get("OS_DELAY", "1.2") or "1.2")
 OS_RETRIES = int(os.environ.get("OS_RETRIES", "6") or "6")
+# Logging in is throttled to avoid 429s. FIRING is not - speed decides the mint.
+OS_FIRE_CONCURRENCY = int(os.environ.get("OS_FIRE_CONCURRENCY", "12") or "12")
+OS_SIG_POLL = float(os.environ.get("OS_SIG_POLL", "0.15") or "0.15")
+_OS_FIRE_SEM = None
+
+
+def os_fire_sem():
+    global _OS_FIRE_SEM
+    if _OS_FIRE_SEM is None:
+        _OS_FIRE_SEM = asyncio.Semaphore(max(1, OS_FIRE_CONCURRENCY))
+    return _OS_FIRE_SEM
+
+
+async def os_fire_call(fn, *args):
+    """Un-throttled OpenSea call for the mint moment: high concurrency, no delay."""
+    async with os_fire_sem():
+        return await run_blocking(fn, *args)
 _OS_SEM = None
 
 
@@ -1215,6 +1232,7 @@ async def help_cmd(update, context):
         "/cancel - stop EVERYTHING\n"
         "/oscheck <collection> - OpenSea WL/FCFS/public eligibility per wallet\n"
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
+        "/oswarm - pre-login all wallets so checks are instant\n"
         "/oslogout - clear OpenSea sessions (if they go stale)\n"
         "/osqty <n> - per-wallet qty for OpenSea mints (default: stage max)\n"
         "/chain <eth|rh> - switch chain\n"
@@ -2878,6 +2896,38 @@ def scan_many(_w3, targets, from_block, to_block):
     return out
 
 
+# scam airdrops are silent unless you turn them on
+SHOW_AIRDROPS = os.environ.get("SHOW_AIRDROPS", "0").strip() not in ("0","false","no")
+AUTO_ELIG = os.environ.get("AUTO_ELIGIBILITY", "1").strip() not in ("0", "false", "no")
+
+
+async def auto_eligibility(context, chat_id, info, collection, chain_key=None):
+    """A tracked wallet minted something - immediately check whether YOUR wallets are
+    eligible and hand back mint buttons, so you don't have to paste the link and wait."""
+    slug = info.get("slug")
+    if not slug:
+        try:
+            sess = next((s for w in STATE["wallets"]
+                         if (s := STATE["os_sessions"].get(w["name"]))), None)
+            if sess:
+                oc = await run_blocking(os_collection_by_contract, sess,
+                                        (CHAINS.get(chain_key) or chain_cfg())["os_chain"],
+                                        collection)
+                slug = (oc or {}).get("slug")
+        except Exception:
+            slug = None
+    if not slug:
+        await context.bot.send_message(
+            chat_id, f"(couldn't resolve an OpenSea collection for {collection[:10]}.. "
+                     "- paste the link manually if you want an eligibility check)")
+        return
+    try:
+        upd = _CbUpdate(type("U", (), {"effective_user": None})(), context, chat_id)
+        await os_autoload(upd, context, slug)
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Auto eligibility check failed: {safe(e, 80)}")
+
+
 async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=None):
     """Alert on any mint/purchase - and for MINTS, replicate it across your wallets.
     Free mints fire immediately; paid mints ask for approval; signature-gated
@@ -2909,9 +2959,28 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
         info = await run_blocking(enrich_collection, _w3, acq["collection"], chain_key)
         STATE["last_sweep"] = {"slug": info.get("slug"), "collection": acq["collection"]}
 
+        _self_sent = bool(sender and target and sender.lower() == target.lower())
+
+        # ---- SPAM FILTER -------------------------------------------------
+        # If the tracked wallet didn't send the transaction, they didn't mint or
+        # buy anything - somebody pushed an NFT at them. That's the standard
+        # scam-airdrop pattern, so it's silent by default.
+        if not _self_sent:
+            if not SHOW_AIRDROPS:
+                log.info("ignored inbound NFT to %s from %s (%s)",
+                         target[:10], (sender or "?")[:10], acq["collection"][:10])
+                return
+            await context.bot.send_message(
+                chat_id,
+                f"INBOUND NFT (not a mint, not a buy) -> {copy_label(target)}\n"
+                f"Sent by {(sender or 'unknown')[:12]}..\n"
+                f"Collection: {info.get('name') or acq['collection']}\n"
+                f"Contract: {acq['collection']}\n"
+                "Almost always a scam airdrop. Nothing was copied.")
+            return
+
         body = format_trade_alert(copy_label(target), info, acq["count"], spent,
                                   acq["ids"], paid_in, chain_key)
-        _self_sent = bool(sender and target and sender.lower() == target.lower())
         if acq["is_mint"]:
             rest = body.split("\n", 1)[1] if "\n" in body else body
             verb = "MINTED" if _self_sent else "RECEIVED (airdrop)"
@@ -2980,11 +3049,14 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
                                  f"({pe * len(STATE['wallets'])} ETH)?", reply_markup=kb)
             else:
                 await context.bot.send_message(
-                    chat_id, "This was a signature-gated WL mint - it can't be copied (the "
-                             "signature only works for their wallet) and no public stage is live.\n"
-                             "-> paste the collection link to check if YOUR wallets are allowlisted.")
+                    chat_id, "Signature-gated WL mint - can't copy their signature. "
+                             "Checking if YOUR wallets are allowlisted...")
+                await auto_eligibility(context, chat_id, info, coll, chain_key)
             return
 
+        if info.get("slug") and AUTO_ELIG:
+            asyncio.create_task(auto_eligibility(context, chat_id, info,
+                                                 acq["collection"], chain_key))
         if spent == 0:
             await context.bot.send_message(
                 chat_id, f"FREE mint on {(CHAINS.get(ck) or {}).get('name', ck)} - "
@@ -3398,7 +3470,7 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
             last = None
             for _ in range(6):                    # phase may flip live a beat late
                 try:
-                    action = await os_retry(os_mint_action, s, coll, wal, per, label=wal["name"])
+                    action = await os_fire_call(os_mint_action, s, coll, wal, per)
                     break
                 except Exception as e:
                     last = e
@@ -3437,7 +3509,7 @@ async def os_prearm(context, chat_id, stage_type, per, wallets, coll, chain_id, 
             if s is None:
                 s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
                 STATE["os_sessions"][wal["name"]] = s
-            action = await os_retry(os_mint_action, s, coll, wal, per, label=wal["name"])
+            action = await os_fire_call(os_mint_action, s, coll, wal, per)
             await run_blocking(os_validate, action, coll, wal, stage_type_of(stage_type), per, chain_id)
             _pw3, _ = wallet_rpc(wal)
             tx = await run_blocking(build_custom_tx, _pw3, wal, action["to"],
@@ -3485,22 +3557,84 @@ def spawn(context, chat_id, coro, label="task"):
     return t
 
 
+async def os_prefetch(wallets, chain_id):
+    """Do the slow RPC work BEFORE the gun: nonce + fees per wallet, cached on the
+    wallet dict so the fire path only has to sign and broadcast."""
+    async def one(wal):
+        try:
+            _w3, _ = wallet_rpc(wal)
+            wal["_pre_nonce"] = await run_blocking(
+                lambda: _w3.eth.get_transaction_count(wal["address"], "pending"))
+        except Exception:
+            wal["_pre_nonce"] = None
+    await asyncio.gather(*[one(w) for w in wallets])
+    try:
+        cached_fees(w3())
+    except Exception:
+        pass
+
+
+async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id, slug,
+                       deadline):
+    """Each wallet independently hammers OpenSea for its signature and fires the
+    INSTANT it gets one. No throttle, no waiting for other wallets."""
+    stype = stage_type_of(stage_key)
+    done, fails = [], []
+
+    async def one(wal):
+        while time.time() < deadline:
+            try:
+                s = STATE["os_sessions"].get(wal["name"])
+                if s is None:
+                    s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
+                    STATE["os_sessions"][wal["name"]] = s
+                action = await os_fire_call(os_mint_action, s, coll, wal, per)
+                await run_blocking(os_validate, action, coll, wal, stype, per, chain_id)
+                txh = await send_with_failover(wal, action["to"], action["data"],
+                                               action["value"], 3, wal.get("_pre_nonce"))
+                done.append(wal["name"])
+                await context.bot.send_message(
+                    chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
+                _pw3, _ = wallet_rpc(wal)
+                asyncio.create_task(copy_confirm(context, chat_id, _pw3, txh, wal["name"]))
+                return
+            except Exception as e:
+                msg = str(e)
+                # not open yet / signature not issued yet -> retry fast
+                if any(k in msg for k in ("not live", "not started", "NotActive",
+                                          "InvalidTime", "no mint action", "not yet")):
+                    await asyncio.sleep(OS_SIG_POLL)
+                    continue
+                if is_os_rate_limited(e):
+                    await asyncio.sleep(0.4)
+                    continue
+                fails.append(f"{wal['name']}: {safe(e, 60)}")
+                return
+        fails.append(f"{wal['name']}: window closed without a signature")
+
+    await asyncio.gather(*[one(w) for w in wallets])
+    out = [f"MINTED: {len(done)}/{len(wallets)} wallets"]
+    if fails:
+        out.append("failed:")
+        out += ["  " + f for f in fails[:8]]
+    await context.bot.send_message(chat_id, "\n".join(out))
+
+
 async def os_auto_stage(context, chat_id, stage_type, qty=None):
-    """Sleep until the phase opens (zero RPC), PRE-ARM shortly before, then blast at T+0."""
+    """Wait (zero RPC), pre-fetch nonces just before, then RACE for the signature at T-0."""
     ctx = STATE.get("os_ctx")
     if not ctx:
         await context.bot.send_message(
-            chat_id,
-            "That collection isn't loaded any more (the bot restarted, so the buttons on "
-            "that older message are stale).\nPaste the OpenSea link again and use the NEW "
-            "buttons.")
+            chat_id, "That collection isn't loaded any more (bot restarted). "
+                     "Paste the OpenSea link again and use the NEW buttons.")
         return
     meta = ctx["meta"].get(stage_type) or {}
     start = meta.get("start")
     names = ctx["elig"].get(stage_type) or []
     wallets = [w for w in STATE["wallets"] if w["name"] in names]
     if not wallets:
-        await context.bot.send_message(chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
+        await context.bot.send_message(
+            chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
         return
     per = qty or STATE.get("os_qty") or ctx["max"].get(stage_type) or 1
     per = max(1, int(per))
@@ -3510,61 +3644,34 @@ async def os_auto_stage(context, chat_id, stage_type, qty=None):
         await context.bot.send_message(
             chat_id, f"SPEND GUARD: {total} ETH needed, limit {MAX_SPEND_ETH}.")
         return
-    lead = float(os.environ.get("OS_PREARM_LEAD", "25") or "25")
+    prep = float(os.environ.get("OS_PREP_LEAD", "20") or "20")
+    window = float(os.environ.get("OS_RACE_WINDOW", "90") or "90")
 
     if start and start > time.time():
         await context.bot.send_message(
             chat_id,
-            f"AUTO-MINT armed for {os_stage_label(stage_type)}\n"
-            f"Opens in {_fmt_eta(start)} ({datetime.fromtimestamp(start, tz=timezone.utc):%H:%M:%S UTC})\n"
-            f"Will pre-fetch signatures {int(lead)}s early, then broadcast at T+0.\n"
-            f"Sleeping - no RPC used. /cancelauto to stop.")
+            f"AUTO-MINT armed: {os_stage_label(stage_type)}\n"
+            f"Opens in {_fmt_eta(start)} "
+            f"({datetime.fromtimestamp(start, tz=timezone.utc):%H:%M:%S UTC})\n"
+            f"{len(wallets)} wallets x{per}. Sleeping (no RPC), prepping {int(prep)}s early, "
+            f"then all wallets race for their signature the moment it opens.")
         while True:
-            left = start - time.time() - lead
+            left = start - time.time() - prep
             if left <= 0:
                 break
             await asyncio.sleep(min(left, 20))
-
-    # --- pre-arm attempt (the fix: get signatures BEFORE the gun) ---
-    armed, errs = {}, []
-    if start and start > time.time():
-        armed, errs = await os_prearm(context, chat_id, stage_type, per, wallets,
-                                      ctx["coll"], ctx["chain_id"], ctx["slug"])
-        if armed:
-            await context.bot.send_message(
-                chat_id, f"PRE-ARMED {len(armed)}/{len(wallets)} wallets - "
-                         f"broadcasting the instant it opens ({_fmt_eta(start)}).")
-        else:
-            await context.bot.send_message(
-                chat_id, "OpenSea won't sign before open - will fetch+fire at T+0."
-                         + (f" ({errs[0]})" if errs else ""))
-        # wait out the remaining time to the exact open
-        while True:
-            left = start - time.time()
-            if left <= 0.05:
-                break
-            await asyncio.sleep(min(left, 0.5) if left < 2 else min(left - 1, 10))
-
-    if armed:
-        fails = await os_blast_armed(context, chat_id, armed)
-        missing = [w for w in wallets if w["name"] not in armed]
-        if fails:
-            await context.bot.send_message(chat_id, f"{len(fails)} broadcast failed:\n"
-                                                    + "\n".join(fails[:5]))
-        if missing:
-            await os_fire_stage(context, chat_id, stage_type, per, only=missing)
+        await os_prefetch(wallets, ctx["chain_id"])          # nonces + fees ready
+        await context.bot.send_message(
+            chat_id, f"Prepped {len(wallets)} wallets. Firing at T-0 ({_fmt_eta(start)}).")
+        while time.time() < start - 0.35:                     # wake just before
+            await asyncio.sleep(min(start - time.time() - 0.3, 5))
     else:
-        await os_fire_stage(context, chat_id, stage_type, per)
+        await os_prefetch(wallets, ctx["chain_id"])
+        await context.bot.send_message(
+            chat_id, f"{os_stage_label(stage_type)} is live - racing now.")
 
-    # --- supply can free up from failed txs in the first seconds: keep trying briefly ---
-    retry_s = float(os.environ.get("OS_RETRY_WINDOW", "8") or "8")
-    if retry_s > 0:
-        deadline = time.time() + retry_s
-        while time.time() < deadline:
-            await asyncio.sleep(1.0)
-            left = [w for w in wallets if not STATE.get("os_done", {}).get(w["name"])]
-            if not left:
-                break
+    await os_race_mint(context, chat_id, stage_type, per, wallets, ctx["coll"],
+                       ctx["chain_id"], ctx["slug"], time.time() + window)
     STATE["auto_tasks"].pop("_os", None)
 
 
@@ -3692,6 +3799,67 @@ async def osmint_cmd(update, context):
 
     res = await asyncio.gather(*[one(w) for w in STATE["wallets"]])
     await update.effective_message.reply_text("\n".join([f"OS mint ({stage_type}):"] + list(res)))
+
+
+@owner_only
+async def warm_sessions_bg(app):
+    """Log wallets into OpenSea on startup so the first eligibility check is fast."""
+    await asyncio.sleep(5)
+    if not STATE.get("wallets"):
+        return
+    _w3 = watch_w3()
+    try:
+        chain_id = await run_blocking(lambda: _w3.eth.chain_id)
+    except Exception:
+        chain_id = CHAIN_ID
+
+    async def one(w):
+        try:
+            if w["name"] not in STATE["os_sessions"]:
+                STATE["os_sessions"][w["name"]] = await os_retry(
+                    os_login, w, "opensea", chain_id, label=w["name"])
+        except Exception:
+            pass
+
+    try:
+        await asyncio.gather(*[one(w) for w in STATE["wallets"]])
+        log.info("OpenSea sessions warm: %d/%d",
+                 len(STATE["os_sessions"]), len(STATE["wallets"]))
+    except Exception as e:
+        log.warning("session warm: %s", e)
+
+
+@owner_only
+async def oswarm_cmd(update, context):
+    """Pre-log every wallet into OpenSea so eligibility checks are instant later."""
+    slug = (STATE.get("os_ctx") or {}).get("slug") or (context.args[0] if context.args else None)
+    slug = os_slug(slug or "") or "opensea"
+    _w3 = watch_w3()
+    try:
+        chain_id = await run_blocking(lambda: _w3.eth.chain_id)
+    except Exception:
+        chain_id = CHAIN_ID
+    todo = [w for w in STATE["wallets"] if w["name"] not in STATE["os_sessions"]]
+    if not todo:
+        await update.effective_message.reply_text(
+            f"All {len(STATE['wallets'])} wallets already have live OpenSea sessions.")
+        return
+    await update.effective_message.reply_text(
+        f"Warming {len(todo)} OpenSea session(s) (~{int(len(todo)*OS_DELAY/max(1,OS_CONCURRENCY))+3}s)...")
+
+    async def one(w):
+        try:
+            STATE["os_sessions"][w["name"]] = await os_retry(os_login, w, slug, chain_id,
+                                                             label=w["name"])
+            return None
+        except Exception as e:
+            return f"{w['name']}: {safe(e, 40)}"
+
+    errs = [e for e in await asyncio.gather(*[one(w) for w in todo]) if e]
+    await update.effective_message.reply_text(
+        f"Sessions ready: {len(STATE['os_sessions'])}/{len(STATE['wallets'])}"
+        + (f"\nfailed: {len(errs)}" if errs else "")
+        + "\nEligibility checks will now be fast.")
 
 
 @owner_only
@@ -4097,9 +4265,12 @@ def main():
         ("copyclear", copyclear_cmd), ("copyremove", copyremove_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),
-        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("chain", chain_cmd), ("copytest", copytest_cmd), ("sweep", sweep_cmd), ("setproof", setproof_cmd),
+        ("rename", rename_cmd), ("oscheck", oscheck_cmd), ("osmint", osmint_cmd), ("oslogout", oslogout_cmd), ("oswarm", oswarm_cmd), ("osqty", osqty_cmd), ("proofapi", proofapi_cmd), ("chain", chain_cmd), ("copytest", copytest_cmd), ("sweep", sweep_cmd), ("setproof", setproof_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
+    async def _post_init(a):
+        asyncio.create_task(warm_sessions_bg(a))
+    app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard_msg))
 

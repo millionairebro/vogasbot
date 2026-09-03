@@ -2337,6 +2337,17 @@ async def cb_handler(update, context):
             await q.edit_message_text(f"Approved: {pend['desc']} - minting...")
         except Exception:
             pass
+        if pend.get("os_stage"):
+            ctx2 = STATE.get("os_ctx") or {}
+            names = (ctx2.get("elig") or {}).get(pend["os_stage"]) or []
+            wl = [w for w in STATE["wallets"] if w["name"] in names]
+            if wl:
+                await os_prefetch(wl, ctx2.get("chain_id") or CHAIN_ID)
+                spawn(context, q.message.chat_id,
+                      os_race_mint(context, q.message.chat_id, pend["os_stage"], pend["per"],
+                                   wl, ctx2["coll"], ctx2["chain_id"], pend["os_slug"],
+                                   time.time() + 60), "Approved mint")
+            return
         await copy_fire(context, q.message.chat_id, pend["to"], pend["data"],
                         pend["value"], pend.get("ck"))
         return
@@ -2898,12 +2909,15 @@ def scan_many(_w3, targets, from_block, to_block):
 
 # scam airdrops are silent unless you turn them on
 SHOW_AIRDROPS = os.environ.get("SHOW_AIRDROPS", "0").strip() not in ("0","false","no")
+# auto-mint what a tracked wallet mints, if you are eligible
+AUTO_MINT_ON_ALERT = os.environ.get("AUTO_MINT_ON_ALERT", "1").strip() not in ("0","false","no")
 AUTO_ELIG = os.environ.get("AUTO_ELIGIBILITY", "1").strip() not in ("0", "false", "no")
 
 
-async def auto_eligibility(context, chat_id, info, collection, chain_key=None):
-    """A tracked wallet minted something - immediately check whether YOUR wallets are
-    eligible and hand back mint buttons, so you don't have to paste the link and wait."""
+async def auto_eligibility(context, chat_id, info, collection, chain_key=None,
+                           auto_act=True):
+    """A tracked wallet minted something -> check if YOUR wallets are eligible and,
+    if auto_act is on: fire free mints immediately, ask approval for paid ones."""
     slug = info.get("slug")
     if not slug:
         try:
@@ -2918,14 +2932,75 @@ async def auto_eligibility(context, chat_id, info, collection, chain_key=None):
             slug = None
     if not slug:
         await context.bot.send_message(
-            chat_id, f"(couldn't resolve an OpenSea collection for {collection[:10]}.. "
-                     "- paste the link manually if you want an eligibility check)")
+            chat_id, f"(no OpenSea collection found for {collection[:10]}.. - "
+                     "paste the link manually to check eligibility)")
         return
     try:
         upd = _CbUpdate(type("U", (), {"effective_user": None})(), context, chat_id)
         await os_autoload(upd, context, slug)
     except Exception as e:
-        await context.bot.send_message(chat_id, f"Auto eligibility check failed: {safe(e, 80)}")
+        await context.bot.send_message(chat_id, f"Eligibility check failed: {safe(e, 80)}")
+        return
+    if not auto_act or not AUTO_MINT_ON_ALERT:
+        return
+
+    ctx = STATE.get("os_ctx") or {}
+    if ctx.get("slug") != slug:
+        return
+    now = time.time()
+    # pick the best LIVE stage we're eligible for: cheapest first, WL before public
+    best = None
+    for key in ctx.get("order", []):
+        names = ctx["elig"].get(key) or []
+        if not names:
+            continue
+        m = ctx["meta"].get(key) or {}
+        st, en = m.get("start"), m.get("end")
+        if st and now < st:
+            continue                      # not open yet
+        if en and now > en:
+            continue                      # already ended
+        price = ctx["price"].get(key) or 0
+        if best is None or price < best[1]:
+            best = (key, price, names)
+    if not best:
+        await context.bot.send_message(
+            chat_id, "No LIVE stage your wallets are eligible for right now.")
+        return
+
+    key, price, names = best
+    per = STATE.get("os_qty") or ctx["max"].get(key) or 1
+    wallets = [w for w in STATE["wallets"] if w["name"] in names]
+    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
+
+    if price == 0:
+        await context.bot.send_message(
+            chat_id, f"FREE and you're eligible -> auto-minting {os_stage_label(key)} "
+                     f"from {len(wallets)} wallet(s) x{per} NOW.")
+        await os_prefetch(wallets, ctx["chain_id"])
+        spawn(context, chat_id,
+              os_race_mint(context, chat_id, key, per, wallets, ctx["coll"],
+                           ctx["chain_id"], slug, time.time() + 60),
+              "Auto-mint")
+        return
+
+    if total > MAX_SPEND_ETH:
+        await context.bot.send_message(
+            chat_id, f"You're eligible for {os_stage_label(key)} at "
+                     f"{Decimal(price)/Decimal(10**18)} ETH, but {total} ETH total is over "
+                     f"your {MAX_SPEND_ETH} limit. Not minting.")
+        return
+    pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
+    STATE["pending"][pid] = {"os_stage": key, "os_slug": slug, "per": per,
+                             "desc": f"{os_stage_label(key)} {total} ETH"}
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"MINT {total} ETH", callback_data=f"cp|a|{pid}"),
+        InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
+    await context.bot.send_message(
+        chat_id,
+        f"PAID mint and you ARE eligible: {os_stage_label(key)}\n"
+        f"{Decimal(price)/Decimal(10**18)} ETH x {len(wallets)} wallets x{per} = {total} ETH\n"
+        "Mint now?", reply_markup=kb)
 
 
 async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=None):
@@ -3569,7 +3644,16 @@ async def os_prefetch(wallets, chain_id):
             wal["_pre_nonce"] = None
     await asyncio.gather(*[one(w) for w in wallets])
     try:
-        cached_fees(w3())
+        cached_fees(w3())                      # fees once, shared
+    except Exception:
+        pass
+    # Fix a gas limit up front so the fire path never pays for eth_estimateGas
+    # (that was a full RPC round-trip per wallet at the worst possible moment).
+    if not STATE.get("gas_limit_override"):
+        STATE["batch_gas"] = int(os.environ.get("MINT_GAS_LIMIT", "350000") or "350000")
+    # open TLS to the sequencer + endpoints so there is no handshake at T-0
+    try:
+        await run_blocking(warm_all)
     except Exception:
         pass
 

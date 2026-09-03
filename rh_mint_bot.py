@@ -890,6 +890,8 @@ OS_APP_ID = "os2-web"
 OS_CONCURRENCY = int(os.environ.get("OS_CONCURRENCY", "2") or "2")
 OS_DELAY = float(os.environ.get("OS_DELAY", "1.2") or "1.2")
 OS_RETRIES = int(os.environ.get("OS_RETRIES", "6") or "6")
+# only pace AFTER a rate-limit; sleeping on every success made checks crawl
+OS_DELAY_ON_SUCCESS = os.environ.get("OS_DELAY_ON_SUCCESS", "0").strip() not in ("0","false","no")
 # Logging in is throttled to avoid 429s. FIRING is not - speed decides the mint.
 OS_FIRE_CONCURRENCY = int(os.environ.get("OS_FIRE_CONCURRENCY", "12") or "12")
 OS_SIG_POLL = float(os.environ.get("OS_SIG_POLL", "0.15") or "0.15")
@@ -989,7 +991,8 @@ async def os_retry(fn, *args, label=""):
         async with os_sem():
             try:
                 res = await run_blocking(fn, *args)
-                await asyncio.sleep(OS_DELAY)      # space out the next one
+                if OS_DELAY_ON_SUCCESS:
+                    await asyncio.sleep(OS_DELAY)
                 return res
             except Exception as e:
                 last = e
@@ -2338,14 +2341,18 @@ async def cb_handler(update, context):
         except Exception:
             pass
         if pend.get("os_stage"):
-            ctx2 = STATE.get("os_ctx") or {}
-            names = (ctx2.get("elig") or {}).get(pend["os_stage"]) or []
-            wl = [w for w in STATE["wallets"] if w["name"] in names]
-            if wl:
-                await os_prefetch(wl, ctx2.get("chain_id") or CHAIN_ID)
+            coll2 = pend.get("os_coll") or (STATE.get("os_ctx") or {}).get("coll")
+            cid2 = pend.get("os_chain_id") or CHAIN_ID
+            wl = list(STATE["wallets"])
+            if not pend.get("os_coll"):
+                names = ((STATE.get("os_ctx") or {}).get("elig") or {}).get(pend["os_stage"]) or []
+                if names:
+                    wl = [w for w in STATE["wallets"] if w["name"] in names]
+            if wl and coll2:
+                await os_prefetch(wl, cid2)
                 spawn(context, q.message.chat_id,
                       os_race_mint(context, q.message.chat_id, pend["os_stage"], pend["per"],
-                                   wl, ctx2["coll"], ctx2["chain_id"], pend["os_slug"],
+                                   wl, coll2, cid2, pend["os_slug"],
                                    time.time() + 60), "Approved mint")
             return
         await copy_fire(context, q.message.chat_id, pend["to"], pend["data"],
@@ -2916,89 +2923,107 @@ AUTO_ELIG = os.environ.get("AUTO_ELIGIBILITY", "1").strip() not in ("0", "false"
 
 async def auto_eligibility(context, chat_id, info, collection, chain_key=None,
                            auto_act=True):
-    """A tracked wallet minted something -> check if YOUR wallets are eligible and,
-    if auto_act is on: fire free mints immediately, ask approval for paid ones."""
+    """A tracked wallet minted something. SPEED MATTERS HERE - a hyped drop sells out
+    in seconds, so we do NOT survey every wallet first.
+
+    One metadata call tells us the live stage and its price. Then:
+      free  -> race every wallet straight at the mint (OpenSea rejects the ones that
+               aren't eligible, so the mint attempt IS the eligibility check)
+      paid  -> one approval button, then the same race
+    The full per-wallet eligibility breakdown is posted afterwards, for the record.
+    """
     slug = info.get("slug")
-    if not slug:
+    sess = next((s for w in STATE["wallets"]
+                 if (s := STATE["os_sessions"].get(w["name"]))), None)
+    ck = (CHAINS.get(chain_key) or chain_cfg())
+    if not slug and sess:
         try:
-            sess = next((s for w in STATE["wallets"]
-                         if (s := STATE["os_sessions"].get(w["name"]))), None)
-            if sess:
-                oc = await run_blocking(os_collection_by_contract, sess,
-                                        (CHAINS.get(chain_key) or chain_cfg())["os_chain"],
-                                        collection)
-                slug = (oc or {}).get("slug")
+            oc = await run_blocking(os_collection_by_contract, sess, ck["os_chain"], collection)
+            slug = (oc or {}).get("slug")
         except Exception:
             slug = None
     if not slug:
         await context.bot.send_message(
-            chat_id, f"(no OpenSea collection found for {collection[:10]}.. - "
-                     "paste the link manually to check eligibility)")
-        return
-    try:
-        upd = _CbUpdate(type("U", (), {"effective_user": None})(), context, chat_id)
-        await os_autoload(upd, context, slug)
-    except Exception as e:
-        await context.bot.send_message(chat_id, f"Eligibility check failed: {safe(e, 80)}")
+            chat_id, f"(no OpenSea collection for {collection[:10]}.. - paste the link to check)")
         return
     if not auto_act or not AUTO_MINT_ON_ALERT:
+        try:
+            await os_autoload(_CbUpdate(type("U", (), {"effective_user": None})(),
+                                        context, chat_id), context, slug)
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"Eligibility check failed: {safe(e, 80)}")
         return
 
-    ctx = STATE.get("os_ctx") or {}
-    if ctx.get("slug") != slug:
+    # --- ONE call: what stages exist, which is live, what does it cost ---
+    if sess is None:
+        try:
+            w0 = STATE["wallets"][0]
+            sess = await os_fire_call(os_login, w0, slug, ck["chain_id"])
+            STATE["os_sessions"][w0["name"]] = sess
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"OpenSea login failed: {safe(e, 60)}")
+            return
+    try:
+        coll = await os_fire_call(os_collection, sess, slug)
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Collection lookup failed: {safe(e, 70)}")
         return
+
     now = time.time()
-    # pick the best LIVE stage we're eligible for: cheapest first, WL before public
-    best = None
-    for key in ctx.get("order", []):
-        names = ctx["elig"].get(key) or []
-        if not names:
+    live = []
+    for st in coll.get("stages") or []:
+        t = st.get("stageType")
+        if not t:
             continue
-        m = ctx["meta"].get(key) or {}
-        st, en = m.get("start"), m.get("end")
-        if st and now < st:
-            continue                      # not open yet
-        if en and now > en:
-            continue                      # already ended
-        price = ctx["price"].get(key) or 0
-        if best is None or price < best[1]:
-            best = (key, price, names)
-    if not best:
-        await context.bot.send_message(
-            chat_id, "No LIVE stage your wallets are eligible for right now.")
+        s_, e_ = os_parse_time(st.get("startTime")), os_parse_time(st.get("endTime"))
+        if (s_ and now < s_) or (e_ and now > e_):
+            continue
+        live.append({"key": f"{t}#{st.get('stageIndex', 0)}",
+                     "max": int(st.get("maxTotalMintableByWallet") or 1)})
+    if not live:
+        await context.bot.send_message(chat_id, "No live stage on that collection right now.")
         return
+    stage = live[0]
+    key = stage["key"]
+    per = STATE.get("os_qty") or stage["max"] or 1
+    wallets = list(STATE["wallets"])
 
-    key, price, names = best
-    per = STATE.get("os_qty") or ctx["max"].get(key) or 1
-    wallets = [w for w in STATE["wallets"] if w["name"] in names]
-    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
+    # price comes from the on-chain drop config (cheap, and authoritative)
+    price = 0
+    try:
+        _w3 = watch_w3(chain_key)
+        pd = await run_blocking(read_public_drop, _w3, collection)
+        if pd:
+            price = int(pd[0])
+    except Exception:
+        price = info.get("price_wei") or 0
 
     if price == 0:
         await context.bot.send_message(
-            chat_id, f"FREE and you're eligible -> auto-minting {os_stage_label(key)} "
-                     f"from {len(wallets)} wallet(s) x{per} NOW.")
-        await os_prefetch(wallets, ctx["chain_id"])
+            chat_id, f"FREE {os_stage_label(key)} live -> racing ALL {len(wallets)} wallets NOW "
+                     f"(ineligible ones just get rejected).")
+        await os_prefetch(wallets, ck["chain_id"])
         spawn(context, chat_id,
-              os_race_mint(context, chat_id, key, per, wallets, ctx["coll"],
-                           ctx["chain_id"], slug, time.time() + 60),
-              "Auto-mint")
+              os_race_mint(context, chat_id, key, per, wallets, coll, ck["chain_id"],
+                           slug, time.time() + 60), "Auto-mint")
         return
 
+    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
     if total > MAX_SPEND_ETH:
         await context.bot.send_message(
-            chat_id, f"You're eligible for {os_stage_label(key)} at "
-                     f"{Decimal(price)/Decimal(10**18)} ETH, but {total} ETH total is over "
-                     f"your {MAX_SPEND_ETH} limit. Not minting.")
+            chat_id, f"{os_stage_label(key)} is PAID ({Decimal(price)/Decimal(10**18)} ETH). "
+                     f"{total} ETH total is over your {MAX_SPEND_ETH} limit - not minting.")
         return
     pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
     STATE["pending"][pid] = {"os_stage": key, "os_slug": slug, "per": per,
+                             "os_coll": coll, "os_chain_id": ck["chain_id"],
                              "desc": f"{os_stage_label(key)} {total} ETH"}
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"MINT {total} ETH", callback_data=f"cp|a|{pid}"),
         InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
     await context.bot.send_message(
         chat_id,
-        f"PAID mint and you ARE eligible: {os_stage_label(key)}\n"
+        f"PAID {os_stage_label(key)} is live\n"
         f"{Decimal(price)/Decimal(10**18)} ETH x {len(wallets)} wallets x{per} = {total} ETH\n"
         "Mint now?", reply_markup=kb)
 
@@ -3670,7 +3695,7 @@ async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id
             try:
                 s = STATE["os_sessions"].get(wal["name"])
                 if s is None:
-                    s = await os_retry(os_login, wal, slug, chain_id, label=wal["name"])
+                    s = await os_fire_call(os_login, wal, slug, chain_id)
                     STATE["os_sessions"][wal["name"]] = s
                 action = await os_fire_call(os_mint_action, s, coll, wal, per)
                 await run_blocking(os_validate, action, coll, wal, stype, per, chain_id)

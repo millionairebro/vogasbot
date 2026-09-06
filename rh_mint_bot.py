@@ -330,6 +330,7 @@ STATE = {
     "copy_tasks":   {},      # chain_key -> watcher task
     "copy_targets": {},      # address -> label (persisted)
     "copy_paused":  False,   # True after /cancelcopy - blocks auto-restart
+    "armed_info":   {},      # armed_key -> details of each armed drop
     "copy_labels":  {},      # legacy alias, kept so copy_label() is safe
 
     "os_sessions":  {},
@@ -495,6 +496,32 @@ async def send_ck(wal, ck, to, data, value, tries=3):
                 continue
             raise
     raise last if last else RuntimeError("send failed")
+
+
+_WALLET_LOCKS = {}
+
+
+def wallet_lock(name):
+    if name not in _WALLET_LOCKS:
+        _WALLET_LOCKS[name] = asyncio.Lock()
+    return _WALLET_LOCKS[name]
+
+
+async def next_nonce(wal):
+    """Hand out a unique, sequential nonce per wallet. Without this, two drops
+    opening at the same second would build two txs with the SAME nonce and one
+    would be dropped."""
+    async with wallet_lock(wal["name"]):
+        n = wal.get("_pre_nonce")
+        if n is None:
+            _w3, _ = wallet_rpc(wal)
+            try:
+                n = await run_blocking(
+                    lambda: _w3.eth.get_transaction_count(wal["address"], "pending"))
+            except Exception:
+                return None
+        wal["_pre_nonce"] = n + 1
+        return n
 
 
 async def send_raw_failover(wal, raw, tries=3):
@@ -1237,7 +1264,8 @@ async def help_cmd(update, context):
         "/osmint <STAGE> [qty] - mint a WL/FCFS/public phase via OpenSea\n"
         "/oswarm - pre-login all wallets so checks are instant\n"
         "/oslogout - clear OpenSea sessions (if they go stale)\n"
-        "/osqty <n> - per-wallet qty for OpenSea mints (default: stage max)\n"
+        "/osqty <n> - per-wallet qty (or tap the x1/x2/MAX buttons)\n"
+        "/autolist - every drop armed for auto-mint (+ cancel one)\n"
         "/chain <eth|rh> - switch chain\n"
         "/sweep <collection> [n] - quote the cheapest listings\n"
         "/proofapi <url> - fetch merkle proofs for all wallets from a site API\n"
@@ -2324,6 +2352,12 @@ async def cb_handler(update, context):
     if len(parts) == 3 and parts[0] == "cp":
         action, pid = parts[1], parts[2]
         pend = STATE["pending"].pop(pid, None)
+        if pend and time.time() - pend.get("_t", 0) > PENDING_TTL:
+            try:
+                await q.edit_message_text("That mint prompt expired.")
+            except Exception:
+                pass
+            return
         if not pend:
             try:
                 await q.edit_message_text("This request was already handled or expired.")
@@ -2391,6 +2425,38 @@ async def cb_handler(update, context):
             "Send me the resulting purchase tx hash + input data and I'll wire the "
             "one-tap sweep exactly like we did for minting.")
         return
+    if parts[0] == "ac" and len(parts) >= 2:
+        k = "|".join(parts[1:])
+        if k == "*":
+            n = 0
+            for kk, t in list(STATE["auto_tasks"].items()):
+                if kk.startswith("os:") and t and not t.done():
+                    t.cancel(); n += 1
+                    STATE["auto_tasks"].pop(kk, None)
+                    STATE.get("armed_info", {}).pop(kk, None)
+            await context.bot.send_message(q.message.chat_id, f"Cancelled {n} armed drop(s).")
+            return
+        t = STATE["auto_tasks"].pop(k, None)
+        if t and not t.done():
+            t.cancel()
+        v = STATE.get("armed_info", {}).pop(k, None)
+        await context.bot.send_message(
+            q.message.chat_id,
+            f"Cancelled {v['slug']} {os_stage_label(v['stage'])}" if v else "Already gone.")
+        return
+    if parts[0] == "osq" and len(parts) == 2:
+        try:
+            STATE["os_qty"] = None if parts[1] == "max" else max(1, int(parts[1]))
+        except ValueError:
+            return
+        shown = STATE["os_qty"] or "max"
+        try:
+            await q.edit_message_reply_markup(reply_markup=os_ctx_buttons())
+        except Exception:
+            pass
+        await context.bot.send_message(
+            q.message.chat_id, f"Mint quantity set to {shown} per wallet.")
+        return
     if parts[0] == "osx":
         act, stage = parts[1], parts[2]
         if act == "r":
@@ -2411,14 +2477,28 @@ async def cb_handler(update, context):
                   os_fire_stage(context, q.message.chat_id, stage), "Mint")
             return
         if act == "a":
-            old = STATE["auto_tasks"].get("_os")
+            ctxk = STATE.get("os_ctx") or {}
+            slug = ctxk.get("slug", "?")
+            key = f"os:{slug}:{stage}"                 # one slot PER DROP
+            old = STATE["auto_tasks"].get(key)
             if old and not old.done():
                 old.cancel()
+            meta = (ctxk.get("meta") or {}).get(stage) or {}
+            per = STATE.get("os_qty") or (ctxk.get("max") or {}).get(stage) or 1
+            STATE.setdefault("armed_info", {})[key] = {
+                "slug": slug, "stage": stage, "per": per,
+                "start": meta.get("start"),
+                "wallets": len((ctxk.get("elig") or {}).get(stage) or []),
+                "price": (ctxk.get("price") or {}).get(stage) or 0,
+                "chain": ACTIVE_CHAIN,
+            }
             await context.bot.send_message(
-                q.message.chat_id, f"Arming AUTO {os_stage_label(stage)}...")
-            STATE["auto_tasks"]["_os"] = spawn(
+                q.message.chat_id,
+                f"ARMED: {slug} {os_stage_label(stage)} x{per}\n"
+                f"{len(STATE.get('armed_info', {}))} drop(s) armed. /autolist to see them.")
+            STATE["auto_tasks"][key] = spawn(
                 context, q.message.chat_id,
-                os_auto_stage(context, q.message.chat_id, stage), "Auto-mint")
+                os_auto_stage(context, q.message.chat_id, stage, None, key), "Auto-mint")
             return
     if parts[0] == "cw":
         if len(parts) == 2 and parts[1] == "add":
@@ -3014,10 +3094,9 @@ async def auto_eligibility(context, chat_id, info, collection, chain_key=None,
             chat_id, f"{os_stage_label(key)} is PAID ({Decimal(price)/Decimal(10**18)} ETH). "
                      f"{total} ETH total is over your {MAX_SPEND_ETH} limit - not minting.")
         return
-    pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
-    STATE["pending"][pid] = {"os_stage": key, "os_slug": slug, "per": per,
-                             "os_coll": coll, "os_chain_id": ck["chain_id"],
-                             "desc": f"{os_stage_label(key)} {total} ETH"}
+    pid = add_pending({"os_stage": key, "os_slug": slug, "per": per,
+                       "os_coll": coll, "os_chain_id": ck["chain_id"],
+                       "desc": f"{os_stage_label(key)} {total} ETH"})
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"MINT {total} ETH", callback_data=f"cp|a|{pid}"),
         InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
@@ -3136,10 +3215,9 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
                                  "is live and free. Minting that for all wallets.")
                     asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub, 0, ck))
                 else:
-                    pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
                     pe = Decimal(price) / Decimal(10 ** 18)
-                    STATE["pending"][pid] = {"to": SEADROP_ADDR, "data": pub, "value": price,
-                                             "ck": ck, "desc": f"{pe} ETH public stage"}
+                    pid = add_pending({"to": SEADROP_ADDR, "data": pub, "value": price,
+                                       "ck": ck, "desc": f"{pe} ETH public stage"})
                     kb = InlineKeyboardMarkup([[
                         InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
                         InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
@@ -3163,11 +3241,10 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
                          f"copying to your {len(STATE['wallets'])} wallets...")
             asyncio.create_task(copy_fire(context, chat_id, to, data, 0, ck))
         else:
-            pid = str(STATE["pending_seq"]); STATE["pending_seq"] += 1
             pe = Decimal(eth_val) / Decimal(10 ** 18)
             tot = pe * len(STATE["wallets"])
-            STATE["pending"][pid] = {"to": to, "data": data, "value": eth_val,
-                                     "ck": ck, "desc": f"{pe} ETH -> {to[:10]}.."}
+            pid = add_pending({"to": to, "data": data, "value": eth_val,
+                               "ck": ck, "desc": f"{pe} ETH -> {to[:10]}.."})
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("Approve", callback_data=f"cp|a|{pid}"),
                 InlineKeyboardButton("Skip", callback_data=f"cp|s|{pid}")]])
@@ -3395,18 +3472,35 @@ def stage_type_of(k):
 
 
 def os_ctx_buttons():
-    """One row per phase: MINT NOW + AUTO (fires at the phase's start time)."""
+    """One row per phase (MINT NOW / AUTO), plus a quantity picker."""
     ctx = STATE.get("os_ctx") or {}
     rows = []
+    maxq = 1
     for t in ctx.get("order", []):
         n = len(ctx["elig"].get(t, []))
         if not n:
             continue
+        maxq = max(maxq, int((ctx.get("max") or {}).get(t) or 1))
         lbl = os_stage_label(t)
         rows.append([
             InlineKeyboardButton(f"MINT {lbl} NOW ({n})", callback_data=f"osx|m|{t}"),
             InlineKeyboardButton(f"AUTO {lbl}", callback_data=f"osx|a|{t}"),
         ])
+    # quantity picker - sensible steps up to the per-wallet cap
+    if maxq > 1:
+        cur = STATE.get("os_qty")
+        opts, seen = [], set()
+        for v in [1, 2, 3, 5, 10, maxq // 2, maxq]:
+            v = int(v)
+            if 1 <= v <= maxq and v not in seen:
+                seen.add(v)
+                opts.append(v)
+        opts = sorted(opts)[:5]
+        qrow = [InlineKeyboardButton(("* " if cur == v else "") + f"x{v}",
+                                     callback_data=f"osq|{v}") for v in opts]
+        qrow.append(InlineKeyboardButton(("* " if cur is None else "") + f"MAX({maxq})",
+                                         callback_data="osq|max"))
+        rows.append(qrow)
     rows.append([InlineKeyboardButton("Refresh eligibility", callback_data="osx|r|-")])
     return InlineKeyboardMarkup(rows)
 
@@ -3497,6 +3591,8 @@ async def os_autoload(update, context, slug):
 
     lines = [f"{coll.get('name') or slug}", f"Contract: {coll['address']}",
              f"Wallets checked: {len(live)}/{len(ws)}"]
+    _q = STATE.get("os_qty")
+    lines.append(f"Mint qty: {_q if _q else 'MAX per wallet'}  (change below)")
     if not order:
         lines.append("\nNo eligible phase for any wallet right now.")
     now = time.time()
@@ -3641,6 +3737,27 @@ async def os_blast_armed(context, chat_id, armed):
     return [f for f in await asyncio.gather(*[fire(n, p) for n, p in armed.items()]) if f]
 
 
+PENDING_MAX = int(os.environ.get("PENDING_MAX", "40") or "40")
+PENDING_TTL = float(os.environ.get("PENDING_TTL", "3600") or "3600")   # 1h
+
+
+def add_pending(entry):
+    """Store an approval prompt, dropping stale/oldest ones so this can't grow
+    forever on a bot that runs for weeks."""
+    now = time.time()
+    entry["_t"] = now
+    p = STATE["pending"]
+    for k in [k for k, v in p.items()
+              if isinstance(v, dict) and now - v.get("_t", now) > PENDING_TTL]:
+        p.pop(k, None)
+    while len(p) >= PENDING_MAX:
+        p.pop(next(iter(p)), None)
+    pid = str(STATE["pending_seq"])
+    STATE["pending_seq"] += 1
+    p[pid] = entry
+    return pid
+
+
 def spawn(context, chat_id, coro, label="task"):
     """asyncio.create_task swallows exceptions - this reports them to you instead."""
     t = asyncio.create_task(coro)
@@ -3663,10 +3780,16 @@ async def os_prefetch(wallets, chain_id):
     async def one(wal):
         try:
             _w3, _ = wallet_rpc(wal)
-            wal["_pre_nonce"] = await run_blocking(
+            chain_n = await run_blocking(
                 lambda: _w3.eth.get_transaction_count(wal["address"], "pending"))
+            # NEVER move the counter backwards. If another armed drop already handed
+            # out nonces from this wallet, the chain may not have caught up yet -
+            # taking its (stale) number would reuse a nonce and silently drop a tx.
+            async with wallet_lock(wal["name"]):
+                cur = wal.get("_pre_nonce")
+                wal["_pre_nonce"] = max(chain_n, cur) if isinstance(cur, int) else chain_n
         except Exception:
-            wal["_pre_nonce"] = None
+            wal.setdefault("_pre_nonce", None)
     await asyncio.gather(*[one(w) for w in wallets])
     try:
         cached_fees(w3())                      # fees once, shared
@@ -3699,8 +3822,9 @@ async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id
                     STATE["os_sessions"][wal["name"]] = s
                 action = await os_fire_call(os_mint_action, s, coll, wal, per)
                 await run_blocking(os_validate, action, coll, wal, stype, per, chain_id)
+                _n = await next_nonce(wal)
                 txh = await send_with_failover(wal, action["to"], action["data"],
-                                               action["value"], 3, wal.get("_pre_nonce"))
+                                               action["value"], 3, _n)
                 done.append(wal["name"])
                 await context.bot.send_message(
                     chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
@@ -3729,7 +3853,7 @@ async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id
     await context.bot.send_message(chat_id, "\n".join(out))
 
 
-async def os_auto_stage(context, chat_id, stage_type, qty=None):
+async def os_auto_stage(context, chat_id, stage_type, qty=None, armed_key=None):
     """Wait (zero RPC), pre-fetch nonces just before, then RACE for the signature at T-0."""
     ctx = STATE.get("os_ctx")
     if not ctx:
@@ -3781,7 +3905,9 @@ async def os_auto_stage(context, chat_id, stage_type, qty=None):
 
     await os_race_mint(context, chat_id, stage_type, per, wallets, ctx["coll"],
                        ctx["chain_id"], ctx["slug"], time.time() + window)
-    STATE["auto_tasks"].pop("_os", None)
+    if armed_key:
+        STATE["auto_tasks"].pop(armed_key, None)
+        STATE.get("armed_info", {}).pop(armed_key, None)
 
 
 @owner_only
@@ -4283,6 +4409,34 @@ async def copytest_cmd(update, context):
 
 
 @owner_only
+async def autolist_cmd(update, context):
+    """Every drop currently armed for auto-mint, with a countdown."""
+    info = STATE.get("armed_info") or {}
+    live = {k: v for k, v in info.items()
+            if (t := STATE["auto_tasks"].get(k)) and not t.done()}
+    for dead in [k for k in info if k not in live]:
+        info.pop(dead, None)
+    if not live:
+        await update.effective_message.reply_text(
+            "No drops armed.\nPaste a collection link and tap AUTO to arm one. "
+            "You can arm as many as you like now.")
+        return
+    lines = [f"ARMED AUTO-MINTS ({len(live)}):"]
+    rows = []
+    for i, (k, v) in enumerate(live.items(), 1):
+        p = Decimal(v["price"]) / Decimal(10 ** 18) if v["price"] else 0
+        when = _fmt_eta(v["start"]) if v.get("start") and v["start"] > time.time() else "LIVE"
+        lines.append(f"\n{i}. {v['slug']}  {os_stage_label(v['stage'])}")
+        lines.append(f"   {v['wallets']} wallets x{v['per']} | "
+                     f"{'FREE' if p == 0 else f'{p} ETH'} | opens {when}")
+        rows.append([InlineKeyboardButton(f"Cancel {i}. {v['slug'][:14]}",
+                                          callback_data=f"ac|{k}")])
+    rows.append([InlineKeyboardButton("Cancel ALL armed", callback_data="ac|*")])
+    await update.effective_message.reply_text("\n".join(lines),
+                                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+@owner_only
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
     lines = [f"RPC pool: {n} endpoint(s), {len(healthy_endpoints())} healthy | "
@@ -4369,7 +4523,7 @@ def main():
         ("newwallet", newwallet_cmd), ("importwallet", importwallet_cmd),
         ("setgas", setgas_cmd), ("copy", copy_cmd),
         ("stopwatch", stopwatch_cmd), ("stopcopy", stopcopy_cmd),
-        ("copywatch", copywatch_cmd), ("copyadd", copyadd_cmd),
+        ("copywatch", copywatch_cmd), ("autolist", autolist_cmd), ("copyadd", copyadd_cmd),
         ("copyclear", copyclear_cmd), ("copyremove", copyremove_cmd), ("rpcstatus", rpcstatus_cmd),
         ("cancelauto", cancelauto_cmd), ("cancelschedule", cancelschedule_cmd),
         ("cancelcopy", cancelcopy_cmd), ("mintloop", mintloop_cmd),

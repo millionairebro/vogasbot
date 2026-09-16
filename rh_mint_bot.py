@@ -1202,10 +1202,22 @@ def os_eligibility(session, slug, wal):
                 price = int(Web3.to_wei(Decimal(str(ep["token"]["unit"])), "ether"))
             except Exception:
                 price = None
+        # eligibleMinterAddress tells us WHOSE eligibility this is. If it is a
+        # different address, the eligibility comes from a linked/delegated wallet,
+        # not the wallet we would actually mint from.
+        ema = st.get("eligibleMinterAddress")
+        relation = None
+        if ema:
+            try:
+                relation = ("own" if Web3.to_checksum_address(ema) ==
+                            Web3.to_checksum_address(wal["address"]) else "linked")
+            except Exception:
+                relation = "linked"
         out.append({
             "type": st.get("stageType"),
             "index": int(st.get("stageIndex") or 0),
-            "eligible": bool(st.get("isEligible")),
+            "eligible": st.get("isEligible"),      # tri-state: True / False / None
+            "relation": relation,
             "max": st.get("eligibleMaxTotalMintableByWallet") or st.get("maxTotalMintableByWallet"),
             "price_wei": price,
         })
@@ -3569,6 +3581,35 @@ def os_ctx_buttons():
     return InlineKeyboardMarkup(rows)
 
 
+INELIGIBLE_MARKERS = ("MinterNotEligible", "NotEligible", "InvalidProof",
+                      "SignerNotAllowed", "NotAllowed")
+
+
+def os_probe_eligible(session, coll, wal, qty=1):
+    """THE authoritative check. Ask OpenSea to build this wallet's mint. If it
+    builds one, the wallet really can mint right now. isEligible alone is only a
+    provisional pre-launch hint - that is what made 18 wallets look eligible when
+    only 2 were."""
+    try:
+        os_mint_action(session, coll, wal, qty)
+        return True
+    except Exception as e:
+        m = str(e)
+        if any(k in m for k in INELIGIBLE_MARKERS):
+            return False
+        return None          # couldn't tell (not live yet, network, rate limit)
+
+
+def stage_is_live(meta, now=None):
+    now = now or time.time()
+    s, e = (meta or {}).get("start"), (meta or {}).get("end")
+    if s and now < s:
+        return False
+    if e and now > e:
+        return False
+    return True
+
+
 async def os_autoload(update, context, slug):
     """Paste an OpenSea link -> log in, read stages + per-wallet eligibility, show buttons."""
     reply = update.effective_message.reply_text
@@ -3630,22 +3671,35 @@ async def os_autoload(update, context, slug):
     results = await asyncio.gather(*[elig(w) for w in live])
     elig_map, price_map, max_map, errs = {}, {}, {}, []
     per_wallet_max = {}          # (stage_key, wallet) -> what THAT wallet may mint
+    used_up = {}                 # stage_key -> wallets that already minted out
+    refused = {}                 # stage_key -> wallets OpenSea refused when probed
+    linked = {}                  # stage_key -> eligible only via a LINKED wallet
     for name, stages, err, minted in results:
         if err:
             errs.append(f"{name}: {err}")
         for s in stages:
             k = f"{s['type']}#{s.get('index', 0)}"
-            elig_map.setdefault(k, []).append(name)
             if s.get("price_wei") is not None:
                 price_map[k] = s["price_wei"]
-            allowed = int(s.get("max") or 0)
-            if allowed:
-                # subtract what this wallet already minted - otherwise we ask for
-                # more than it can have and OpenSea rejects the whole request
+            cap = int(s.get("max") or 0)
+            allowed = cap
+            if cap:
+                # what's LEFT for this wallet, after what it already minted
                 try:
-                    allowed = max(0, allowed - int(minted or 0))
+                    allowed = max(0, cap - int(minted or 0))
                 except Exception:
-                    pass
+                    allowed = cap
+            if cap and allowed <= 0:
+                # on the allowlist, but nothing left to mint - do NOT list it as
+                # eligible, it would only fail with InsufficientMintsRemaining
+                used_up.setdefault(k, []).append(name)
+                continue
+            if s.get("eligible") is False:
+                continue                       # OpenSea says no outright
+            if s.get("relation") == "linked":
+                linked.setdefault(k, []).append(name)
+            elig_map.setdefault(k, []).append(name)
+            if allowed:
                 per_wallet_max[(k, name)] = allowed
                 max_map[k] = max(allowed, max_map.get(k, 0))
             stage_meta.setdefault(k, {"start": None, "end": None,
@@ -3659,19 +3713,55 @@ async def os_autoload(update, context, slug):
         except Exception:
             return (base, 0)
 
-    order = sorted(elig_map.keys(), key=_rank)
+    order = sorted(set(list(elig_map.keys()) + list(used_up.keys())), key=_rank)
+    verdicts = {}                       # (stage_key, wallet) -> "verified"/"no"/"provisional"
+    probe_targets = []
+    for k, names in elig_map.items():
+        if stage_type_of(k) == "PUBLIC_SALE":
+            continue
+        if not stage_is_live(stage_meta.get(k)):
+            continue
+        for n in names:
+            probe_targets.append((k, n))
+    if probe_targets:
+        await reply(f"Verifying {len(probe_targets)} wallet(s) against the live stage...")
+
+        async def probe(k, n):
+            w = next((x for x in STATE["wallets"] if x["name"] == n), None)
+            s = STATE["os_sessions"].get(n)
+            if not w or s is None:
+                return k, n, "provisional"
+            r = await os_fire_call(os_probe_eligible, s, coll, w, 1)
+            return k, n, ("verified" if r is True else "no" if r is False else "provisional")
+
+        for k, n, v in await asyncio.gather(*[probe(k, n) for k, n in probe_targets]):
+            verdicts[(k, n)] = v
+        # drop the ones OpenSea actively refused
+        for (k, n), v in list(verdicts.items()):
+            if v == "no" and n in elig_map.get(k, []):
+                elig_map[k].remove(n)
+                refused.setdefault(k, []).append(n)
+
+
     STATE["os_ctx"] = {"slug": slug, "coll": coll, "elig": elig_map, "price": price_map,
                        "max": max_map, "wmax": per_wallet_max, "meta": stage_meta,
-                       "order": order, "chain_id": chain_id}
+                       "order": order, "chain_id": chain_id, "verdicts": verdicts,
+                       "linked": linked, "refused": refused}
 
     lines = [f"{coll.get('name') or slug}", f"Contract: {coll['address']}",
              f"Wallets checked: {len(live)}/{len(ws)}"]
+    # --- verify live private stages by probing the real mint action ---
     _q = STATE.get("os_qty")
     lines.append(f"Mint qty: {_q if _q else 'MAX per wallet'}  (change below)")
     if not order:
         lines.append("\nNo eligible phase for any wallet right now.")
     now = time.time()
     for t in order:
+        if not elig_map.get(t):
+            n_out = len(used_up.get(t, []))
+            lines.append(f"\n{os_stage_label(t)}: 0 wallets can mint"
+                         + (f" ({n_out} already minted out)" if n_out else ""))
+            continue
         p = price_map.get(t)
         pe = "?" if p is None else ("FREE" if p == 0 else f"{to_units(p)} {chain_symbol()}")
         m = stage_meta.get(t, {})
@@ -3687,8 +3777,23 @@ async def os_autoload(update, context, slug):
         _allow = [per_wallet_max.get((t, n), 0) for n in names]
         _lo, _hi = (min(_allow), max(_allow)) if _allow else (0, 0)
         _mtxt = f"{_lo}" if _lo == _hi else f"{_lo}-{_hi}"
+        _live = stage_is_live(stage_meta.get(t))
+        _pub = stage_type_of(t) == "PUBLIC_SALE"
+        if _pub:
+            _conf = "public - open to all"
+        elif _live:
+            _v = sum(1 for n in names if verdicts.get((t, n)) == "verified")
+            _conf = f"VERIFIED {_v}/{len(names)}" if _v else "unverified"
+        else:
+            _conf = "PROVISIONAL - not verifiable until the stage opens"
         lines.append(f"\n{os_stage_label(t)}: {len(names)}/{len(ws)} wallets | "
                      f"max {_mtxt}/wallet | {pe}{when}")
+        lines.append(f"   [{_conf}]")
+        if refused.get(t):
+            lines.append(f"   refused when checked: {len(refused[t])} wallet(s)")
+        if linked.get(t):
+            lines.append(f"   via LINKED wallet (may not mint from these): "
+                         f"{', '.join(linked[t][:6])}")
         # name the eligible wallets, and show who's missing out
         by_addr = {w["name"]: w["address"] for w in STATE["wallets"]}
         if len(names) <= 8:
@@ -3699,7 +3804,12 @@ async def os_autoload(update, context, slug):
                 lines.append((f"   {n}  {a[:8]}..{a[-4:]}{suffix}") if a else f"   {n}{suffix}")
         else:
             lines.append("   " + ", ".join(names))
-        missing = [w["name"] for w in ws if w["name"] not in names]
+        spent_out = used_up.get(t, [])
+        if spent_out:
+            lines.append(f"   already minted out: {len(spent_out)} wallet(s)"
+                         + (f" ({', '.join(spent_out)})" if len(spent_out) <= 8 else ""))
+        missing = [w["name"] for w in ws
+                   if w["name"] not in names and w["name"] not in spent_out]
         if missing and len(missing) <= 8:
             lines.append(f"   not eligible: {', '.join(missing)}")
         elif missing:
@@ -3929,7 +4039,8 @@ async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id
                 msg = str(e)
                 # not open yet / signature not issued yet -> retry fast
                 if any(k in msg for k in ("not live", "not started", "NotActive",
-                                          "InvalidTime", "no mint action", "not yet")):
+                                          "InvalidTime", "no mint action", "not yet",
+                                          "ActiveDropStage", "DropStageNotActive")):
                     await asyncio.sleep(OS_SIG_POLL)
                     continue
                 if is_os_rate_limited(e):
@@ -3993,8 +4104,8 @@ async def os_auto_stage(context, chat_id, stage_type, qty=None, armed_key=None):
         await os_prefetch(wallets, ctx["chain_id"])          # nonces + fees ready
         await context.bot.send_message(
             chat_id, f"Prepped {len(wallets)} wallets. Firing at T-0 ({_fmt_eta(start)}).")
-        while time.time() < start - 0.35:                     # wake just before
-            await asyncio.sleep(min(start - time.time() - 0.3, 5))
+        while time.time() < start:                            # never fire early
+            await asyncio.sleep(min(max(start - time.time(), 0.01), 5))
     else:
         await os_prefetch(wallets, ctx["chain_id"])
         await context.bot.send_message(

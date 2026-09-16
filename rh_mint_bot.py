@@ -101,10 +101,46 @@ CHAINS = {
         "os_slug_chain": "ethereum",
     },
 }
+# ---- extra chains defined purely in .env, e.g.:
+#   EXTRA_CHAINS=arc
+#   ARC_NAME=Arc
+#   ARC_CHAIN_ID=...
+#   ARC_RPC_POOL=https://...,https://...
+#   ARC_PUBLIC_RPC=https://...
+#   ARC_OS_CHAIN=arc            <- what OpenSea calls it in URLs
+#   ARC_EXPLORER=https://arcscan.app
+#   ARC_ABI_API=https://arcscan.app/api
+for _k in [c.strip().lower() for c in re.split(
+        r"[,\s]+", os.environ.get("EXTRA_CHAINS", "").strip()) if c.strip()]:
+    _U = _k.upper()
+    _pool_k = _pool(f"{_U}_RPC_POOL", os.environ.get(f"{_U}_PUBLIC_RPC", "").strip())
+    _cid = os.environ.get(f"{_U}_CHAIN_ID", "").strip()
+    if not _pool_k or not _cid.isdigit():
+        log.warning("chain '%s' skipped: need %s_CHAIN_ID and %s_RPC_POOL", _k, _U, _U)
+        continue
+    _exp = os.environ.get(f"{_U}_EXPLORER", "").strip().rstrip("/")
+    _dec = os.environ.get(f"{_U}_DECIMALS", "18").strip()
+    CHAINS[_k] = {
+        "name": os.environ.get(f"{_U}_NAME", _k.title()).strip(),
+        "chain_id": int(_cid),
+        "os_chain": os.environ.get(f"{_U}_OS_CHAIN", _k).strip(),
+        "pool": _pool_k,
+        "watch": os.environ.get(f"{_U}_WATCH_RPC", "").strip(),
+        "explorer": _exp,
+        "abi_api": os.environ.get(f"{_U}_ABI_API", (_exp + "/api") if _exp else "").strip(),
+        "sequencer": os.environ.get(f"{_U}_SEQUENCER_URL", "").strip(),
+        "public": os.environ.get(f"{_U}_PUBLIC_RPC", _pool_k[0]).strip(),
+        "os_slug_chain": os.environ.get(f"{_U}_OS_CHAIN", _k).strip(),
+        "decimals": int(_dec) if _dec.isdigit() else 18,
+        "symbol": os.environ.get(f"{_U}_SYMBOL", "ETH").strip(),
+    }
+    log.info("chain '%s' added from env (id %s, %s decimals, gas %s)", _k, _cid,
+             CHAINS[_k]["decimals"], CHAINS[_k]["symbol"])
+
 ACTIVE_CHAIN = os.environ.get("DEFAULT_CHAIN", "rh").strip().lower()
 # copy-watching always runs on ALL of these at once - no chain switching needed
-WATCH_CHAINS = [c.strip().lower() for c in
-                os.environ.get("WATCH_CHAINS", "eth,ink,rh").split(",") if c.strip()]
+WATCH_CHAINS = [c.strip().lower() for c in re.split(
+    r"[,\s]+", os.environ.get("WATCH_CHAINS", "").strip()) if c.strip()] or list(CHAINS)
 COPYWATCH_FILE = os.environ.get("COPYWATCH_FILE", "copywatch.json").strip()
 
 
@@ -154,6 +190,19 @@ def watch_w3(chain_key=None):
         _WATCH_CACHE[key] = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 12}))
     return _WATCH_CACHE[key]
 MAX_SPEND_ETH = Decimal(os.environ.get("RH_MAX_SPEND_ETH", "0.5") or "0.5")
+
+
+def max_spend(ck=None):
+    """Spend cap for a chain. Arc pays in USDC, so one ETH-shaped number would
+    make the cap fifty cents there - set <CHAIN>_MAX_SPEND to override."""
+    key = (ck or ACTIVE_CHAIN if "ACTIVE_CHAIN" in globals() else ck) or ""
+    v = os.environ.get(f"{str(key).upper()}_MAX_SPEND", "").strip()
+    if v:
+        try:
+            return Decimal(v)
+        except Exception:
+            pass
+    return MAX_SPEND_ETH
 CHAIN_ID       = int(os.environ.get("RH_CHAIN_ID", "4663") or "4663")
 BLOCKSCOUT     = os.environ.get("RH_BLOCKSCOUT_API", "https://robinhoodchain.blockscout.com/api").strip()
 EXPLORER       = os.environ.get("RH_EXPLORER", "https://robinhoodchain.blockscout.com").rstrip("/")
@@ -690,18 +739,32 @@ def suggest_fees(_w3):
     return int(base) * 2 + prio, prio
 
 
+def chain_decimals(ck=None):
+    return int((CHAINS.get(ck) or chain_cfg()).get("decimals", 18))
+
+
+def chain_symbol(ck=None):
+    return (CHAINS.get(ck) or chain_cfg()).get("symbol", "ETH")
+
+
+def to_units(wei, ck=None):
+    """Native amount in human units. Arc pays gas in USDC, which may not be 18
+    decimals - dividing by 1e18 there would make the spend guard useless."""
+    return Decimal(int(wei or 0)) / (Decimal(10) ** chain_decimals(ck))
+
+
 def total_spend_eth(wallets=None):
     ws = wallets if wallets is not None else STATE["wallets"]
-    return sum((Decimal(wallet_value(w)) / Decimal(10 ** 18)) for w in ws)
+    return sum(to_units(wallet_value(w)) for w in ws)
 
 
 def spend_guard(wallets=None):
     """Refuse a batch that would spend more than RH_MAX_SPEND_ETH in one go."""
     total = total_spend_eth(wallets)
-    if total > MAX_SPEND_ETH:
+    if total > max_spend(locals().get('chain_key')):
         raise RuntimeError(
-            f"SPEND GUARD: this would spend {total} ETH across wallets, over the "
-            f"{MAX_SPEND_ETH} ETH limit. Raise RH_MAX_SPEND_ETH in .env if intended.")
+            f"SPEND GUARD: this would spend {total} {chain_symbol()} across wallets, "
+            f"over the {max_spend()} limit. Raise RH_MAX_SPEND_ETH in .env if intended.")
     return total
 
 
@@ -1291,7 +1354,7 @@ async def wallets_cmd(update, context):
         try:
             bal = _w3.eth.get_balance(wal["address"])
             lines.append(f"[{wal['name']}] {wal['address'][:8]}..{wal['address'][-4:]}  "
-                         f"{Decimal(bal)/Decimal(10**18):.5f} ETH  qty {wal['qty']}  {tag}")
+                         f"{to_units(bal):.5f} {chain_symbol()}  qty {wal['qty']}  {tag}")
         except Exception as e:
             if is_rate_limit(e):
                 mark_rate_limited(_url)
@@ -1333,7 +1396,7 @@ async def _try_seadrop(_w3, addr, msg):
             STATE["seadrop_fee"] = await run_blocking(resolve_fee_recipient, _w3, addr)
         except Exception:
             STATE["seadrop_fee"] = OPENSEA_FEE_RECIPIENT
-        msg.append(f"OpenSea SeaDrop mint - price {Decimal(int(pd[0]))/Decimal(10**18)} ETH, "
+        msg.append(f"OpenSea SeaDrop mint - price {to_units(int(pd[0]))} {chain_symbol()}, "
                    f"max {int(pd[3])}/wallet. Calldata auto-built for every wallet.")
         return True
     return False
@@ -1366,7 +1429,7 @@ async def do_source(update, context, text):
                 pg, pv = None, None
             if pv is not None:
                 STATE["value_wei"] = pv
-                msg.append(f"Price: {Decimal(pv)/Decimal(10**18)} ETH")
+                msg.append(f"Price: {to_units(pv)} {chain_symbol()}")
             top_nm, top_inp = fns[0]
             simple = (len(top_inp) == 0
                       or (len(top_inp) == 1 and top_inp[0].startswith("uint"))
@@ -1495,7 +1558,7 @@ async def status_cmd(update, context):
         lines.append(f"Mint fn: {STATE['fn']}({','.join(STATE['fn_inputs'] or [])})")
     else:
         lines.append("Mint fn: - (proof mint -> per-wallet calldata, or run /source)")
-    lines.append(f"Default qty: {STATE['qty']}  price/mint: {Decimal(STATE['value_wei'])/Decimal(10**18)} ETH")
+    lines.append(f"Default qty: {STATE['qty']}  price/mint: {to_units(STATE['value_wei'])} {chain_symbol()}")
     armed = sum(1 for w in STATE["wallets"] if w.get("armed"))
     lines.append(f"Armed: {armed}/{len(STATE['wallets'])}")
     running = any(t and not t.done() for t in STATE["auto_tasks"].values())
@@ -2152,7 +2215,7 @@ def format_mint(info):
     if info.get("qty"):
         bits.append(f"qty {info['qty']}")
     if info.get("price_wei") is not None:
-        p = Decimal(info["price_wei"]) / Decimal(10 ** 18)
+        p = to_units(info["price_wei"], chain_key)
         bits.append("FREE" if p == 0 else f"{p} ETH")
     if info.get("max_wallet"):
         bits.append(f"max {info['max_wallet']}/wallet")
@@ -2742,7 +2805,7 @@ def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="E
     L.append(f"Contract: {info['address']}")
     L.append(f"Chain: {c['name']}")
     if spent_wei:
-        eth = Decimal(spent_wei) / Decimal(10 ** 18)
+        eth = to_units(spent_wei, chain_key)
         each = (eth / count) if count else eth
         L.append(f"Paid: {eth:.4f} {paid_in}  ({each:.4f} each)")
     fl = info.get("floor")
@@ -2750,7 +2813,7 @@ def format_trade_alert(label, info, count, spent_wei, token_ids=None, paid_in="E
     if fl and spent_wei and count:
         try:
             fnum = Decimal(str(fl).split()[0])
-            each = (Decimal(spent_wei) / Decimal(10 ** 18)) / count
+            each = to_units(spent_wei, chain_key) / count
             if fnum > 0:
                 d = ((each - fnum) / fnum) * 100
                 L.append(f"  -> paid {abs(d):.0f}% {'ABOVE' if d > 0 else 'below'} floor")
@@ -3088,11 +3151,12 @@ async def auto_eligibility(context, chat_id, info, collection, chain_key=None,
                            slug, time.time() + 60), "Auto-mint")
         return
 
-    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
-    if total > MAX_SPEND_ETH:
+    total = to_units(Decimal(price) * per * len(wallets), chain_key)
+    if total > max_spend(locals().get('chain_key')):
         await context.bot.send_message(
-            chat_id, f"{os_stage_label(key)} is PAID ({Decimal(price)/Decimal(10**18)} ETH). "
-                     f"{total} ETH total is over your {MAX_SPEND_ETH} limit - not minting.")
+            chat_id, f"{os_stage_label(key)} is PAID ({to_units(price, chain_key)} "
+                     f"{chain_symbol(chain_key)}). "
+                     f"{total} ETH total is over your {max_spend()} limit - not minting.")
         return
     pid = add_pending({"os_stage": key, "os_slug": slug, "per": per,
                        "os_coll": coll, "os_chain_id": ck["chain_id"],
@@ -3103,7 +3167,7 @@ async def auto_eligibility(context, chat_id, info, collection, chain_key=None,
     await context.bot.send_message(
         chat_id,
         f"PAID {os_stage_label(key)} is live\n"
-        f"{Decimal(price)/Decimal(10**18)} ETH x {len(wallets)} wallets x{per} = {total} ETH\n"
+        f"{to_units(price, chain_key)} {chain_symbol(chain_key)} x {len(wallets)} wallets x{per} = {total}\n"
         "Mint now?", reply_markup=kb)
 
 
@@ -3215,7 +3279,7 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
                                  "is live and free. Minting that for all wallets.")
                     asyncio.create_task(copy_fire(context, chat_id, SEADROP_ADDR, pub, 0, ck))
                 else:
-                    pe = Decimal(price) / Decimal(10 ** 18)
+                    pe = to_units(price, ck)
                     pid = add_pending({"to": SEADROP_ADDR, "data": pub, "value": price,
                                        "ck": ck, "desc": f"{pe} ETH public stage"})
                     kb = InlineKeyboardMarkup([[
@@ -3241,7 +3305,7 @@ async def report_acquisition(context, chat_id, target, txh, acq, _w3, chain_key=
                          f"copying to your {len(STATE['wallets'])} wallets...")
             asyncio.create_task(copy_fire(context, chat_id, to, data, 0, ck))
         else:
-            pe = Decimal(eth_val) / Decimal(10 ** 18)
+            pe = to_units(eth_val, ck)
             tot = pe * len(STATE["wallets"])
             pid = add_pending({"to": to, "data": data, "value": eth_val,
                                "ck": ck, "desc": f"{pe} ETH -> {to[:10]}.."})
@@ -3556,15 +3620,17 @@ async def os_autoload(update, context, slug):
 
     async def elig(w):
         try:
-            stages, _ = await os_retry(os_eligibility, STATE["os_sessions"][w["name"]], slug, w,
-                                       label=w["name"])
-            return w["name"], [s for s in stages if s["eligible"]], None
+            stages, minted = await os_retry(os_eligibility,
+                                            STATE["os_sessions"][w["name"]], slug, w,
+                                            label=w["name"])
+            return w["name"], [s for s in stages if s["eligible"]], None, minted
         except Exception as e:
-            return w["name"], [], safe(e, 40)
+            return w["name"], [], safe(e, 40), None
 
     results = await asyncio.gather(*[elig(w) for w in live])
     elig_map, price_map, max_map, errs = {}, {}, {}, []
-    for name, stages, err in results:
+    per_wallet_max = {}          # (stage_key, wallet) -> what THAT wallet may mint
+    for name, stages, err, minted in results:
         if err:
             errs.append(f"{name}: {err}")
         for s in stages:
@@ -3572,8 +3638,16 @@ async def os_autoload(update, context, slug):
             elig_map.setdefault(k, []).append(name)
             if s.get("price_wei") is not None:
                 price_map[k] = s["price_wei"]
-            if s.get("max"):
-                max_map[k] = max(int(s["max"] or 0), max_map.get(k, 0))
+            allowed = int(s.get("max") or 0)
+            if allowed:
+                # subtract what this wallet already minted - otherwise we ask for
+                # more than it can have and OpenSea rejects the whole request
+                try:
+                    allowed = max(0, allowed - int(minted or 0))
+                except Exception:
+                    pass
+                per_wallet_max[(k, name)] = allowed
+                max_map[k] = max(allowed, max_map.get(k, 0))
             stage_meta.setdefault(k, {"start": None, "end": None,
                                       "index": s.get("index", 0), "type": s["type"]})
 
@@ -3587,7 +3661,8 @@ async def os_autoload(update, context, slug):
 
     order = sorted(elig_map.keys(), key=_rank)
     STATE["os_ctx"] = {"slug": slug, "coll": coll, "elig": elig_map, "price": price_map,
-                       "max": max_map, "meta": stage_meta, "order": order, "chain_id": chain_id}
+                       "max": max_map, "wmax": per_wallet_max, "meta": stage_meta,
+                       "order": order, "chain_id": chain_id}
 
     lines = [f"{coll.get('name') or slug}", f"Contract: {coll['address']}",
              f"Wallets checked: {len(live)}/{len(ws)}"]
@@ -3598,7 +3673,7 @@ async def os_autoload(update, context, slug):
     now = time.time()
     for t in order:
         p = price_map.get(t)
-        pe = "?" if p is None else ("FREE" if p == 0 else f"{Decimal(p)/Decimal(10**18)} ETH")
+        pe = "?" if p is None else ("FREE" if p == 0 else f"{to_units(p)} {chain_symbol()}")
         m = stage_meta.get(t, {})
         when = ""
         if m.get("start"):
@@ -3609,14 +3684,19 @@ async def os_autoload(update, context, slug):
             else:
                 when = " | LIVE NOW"
         names = elig_map[t]
+        _allow = [per_wallet_max.get((t, n), 0) for n in names]
+        _lo, _hi = (min(_allow), max(_allow)) if _allow else (0, 0)
+        _mtxt = f"{_lo}" if _lo == _hi else f"{_lo}-{_hi}"
         lines.append(f"\n{os_stage_label(t)}: {len(names)}/{len(ws)} wallets | "
-                     f"max {max_map.get(t, '?')}/wallet | {pe}{when}")
+                     f"max {_mtxt}/wallet | {pe}{when}")
         # name the eligible wallets, and show who's missing out
         by_addr = {w["name"]: w["address"] for w in STATE["wallets"]}
         if len(names) <= 8:
             for n in names:
                 a = by_addr.get(n, "")
-                lines.append(f"   {n}  {a[:8]}..{a[-4:]}" if a else f"   {n}")
+                cap = per_wallet_max.get((t, n))
+                suffix = f"  (can mint {cap})" if cap else ""
+                lines.append((f"   {n}  {a[:8]}..{a[-4:]}{suffix}") if a else f"   {n}{suffix}")
         else:
             lines.append("   " + ", ".join(names))
         missing = [w["name"] for w in ws if w["name"] not in names]
@@ -3644,10 +3724,10 @@ async def os_fire_stage(context, chat_id, stage_type, qty=None, only=None):
     per = qty or STATE.get("os_qty") or ctx["max"].get(stage_type) or 1
     per = max(1, int(per))
     price = ctx["price"].get(stage_type) or 0
-    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
-    if total > MAX_SPEND_ETH:
+    total = to_units(Decimal(price) * per * len(wallets))
+    if total > max_spend(locals().get('chain_key')):
         await context.bot.send_message(
-            chat_id, f"SPEND GUARD: {total} ETH needed, limit is {MAX_SPEND_ETH}. "
+            chat_id, f"SPEND GUARD: {total} ETH needed, limit is {max_spend()}. "
                      f"Raise RH_MAX_SPEND_ETH or lower qty with /osqty.")
         return
     STATE["batch_gas"] = None
@@ -3813,19 +3893,33 @@ async def os_race_mint(context, chat_id, stage_key, per, wallets, coll, chain_id
     stype = stage_type_of(stage_key)
     done, fails = [], []
 
+    wmax = (STATE.get("os_ctx") or {}).get("wmax") or {}
+    user_q = STATE.get("os_qty")
+
+    def qty_for(wal):
+        """Never ask for more than THIS wallet is allowed - over-asking makes
+        OpenSea reject the whole mint with InsufficientMintsRemaining."""
+        cap = wmax.get((stage_key, wal["name"]))
+        if cap is None:
+            cap = per
+        if user_q:
+            return max(1, min(int(user_q), int(cap) if cap else int(user_q)))
+        return max(1, int(cap) if cap else per)
+
     async def one(wal):
+        wper = qty_for(wal)
         while time.time() < deadline:
             try:
                 s = STATE["os_sessions"].get(wal["name"])
                 if s is None:
                     s = await os_fire_call(os_login, wal, slug, chain_id)
                     STATE["os_sessions"][wal["name"]] = s
-                action = await os_fire_call(os_mint_action, s, coll, wal, per)
-                await run_blocking(os_validate, action, coll, wal, stype, per, chain_id)
+                action = await os_fire_call(os_mint_action, s, coll, wal, wper)
+                await run_blocking(os_validate, action, coll, wal, stype, wper, chain_id)
                 _n = await next_nonce(wal)
                 txh = await send_with_failover(wal, action["to"], action["data"],
                                                action["value"], 3, _n)
-                done.append(wal["name"])
+                done.append(f"{wal['name']}x{wper}")
                 await context.bot.send_message(
                     chat_id, f"[{wal['name']}] SENT {txh}\n{EXPLORER}/tx/{txh}")
                 _pw3, _ = wallet_rpc(wal)
@@ -3869,13 +3963,16 @@ async def os_auto_stage(context, chat_id, stage_type, qty=None, armed_key=None):
         await context.bot.send_message(
             chat_id, f"No wallets eligible for {os_stage_label(stage_type)}.")
         return
+    _wm = ctx.get("wmax") or {}
     per = qty or STATE.get("os_qty") or ctx["max"].get(stage_type) or 1
     per = max(1, int(per))
     price = ctx["price"].get(stage_type) or 0
-    total = (Decimal(price) * per * len(wallets)) / Decimal(10 ** 18)
-    if total > MAX_SPEND_ETH:
+    # total uses each wallet's OWN allowance, not the highest one
+    _units = sum(min(per, _wm.get((stage_type, w["name"]), per)) for w in wallets)
+    total = to_units(Decimal(price) * _units, ctx.get("ck"))
+    if total > max_spend(locals().get('chain_key')):
         await context.bot.send_message(
-            chat_id, f"SPEND GUARD: {total} ETH needed, limit {MAX_SPEND_ETH}.")
+            chat_id, f"SPEND GUARD: {total} ETH needed, limit {max_spend()}.")
         return
     prep = float(os.environ.get("OS_PREP_LEAD", "20") or "20")
     window = float(os.environ.get("OS_RACE_WINDOW", "90") or "90")
@@ -3960,7 +4057,7 @@ async def oscheck_cmd(update, context):
                 return f"[{wal['name']}] no eligible phase"
             bits = []
             for st in elig:
-                p = (Decimal(st["price_wei"]) / Decimal(10 ** 18)) if st["price_wei"] is not None else "?"
+                p = to_units(st["price_wei"]) if st["price_wei"] is not None else "?"
                 bits.append(f"{st['type']}(idx{st['index']}) max {st['max']} @ {p} ETH")
             return f"[{wal['name']}] " + " | ".join(bits)
         except Exception as e:
@@ -4348,7 +4445,7 @@ async def do_sweep_quote(reply, slug, n):
     for l in listings:
         lines.append(f"  #{l['token_id']}  {l['price']} {l['symbol']}")
     lines.append(f"\nTotal: {total} ETH")
-    if total > MAX_SPEND_ETH:
+    if total > max_spend(locals().get('chain_key')):
         lines.append(f"\nSPEND GUARD: over your {MAX_SPEND_ETH} ETH limit - blocked.")
         await reply("\n".join(lines))
         return
@@ -4424,7 +4521,7 @@ async def autolist_cmd(update, context):
     lines = [f"ARMED AUTO-MINTS ({len(live)}):"]
     rows = []
     for i, (k, v) in enumerate(live.items(), 1):
-        p = Decimal(v["price"]) / Decimal(10 ** 18) if v["price"] else 0
+        p = to_units(v["price"], v.get("chain")) if v["price"] else 0
         when = _fmt_eta(v["start"]) if v.get("start") and v["start"] > time.time() else "LIVE"
         lines.append(f"\n{i}. {v['slug']}  {os_stage_label(v['stage'])}")
         lines.append(f"   {v['wallets']} wallets x{v['per']} | "
@@ -4440,7 +4537,7 @@ async def autolist_cmd(update, context):
 async def rpcstatus_cmd(update, context):
     n = len(RPC_POOL)
     lines = [f"RPC pool: {n} endpoint(s), {len(healthy_endpoints())} healthy | "
-             f"{len(STATE['wallets'])} wallets | max spend {MAX_SPEND_ETH} ETH"]
+             f"{len(STATE['wallets'])} wallets | max spend {max_spend()} {chain_symbol()}"]
 
     async def chk(i):
         url = RPC_POOL[i]

@@ -3600,6 +3600,52 @@ def os_probe_eligible(session, coll, wal, qty=1):
         return None          # couldn't tell (not live yet, network, rate limit)
 
 
+def wallet_can_attempt(st):
+    """Reference rule (osnm multi_mint.rs::wallet_can_attempt):
+
+        relation != LinkedWallet
+        AND (stage is PUBLIC_SALE OR is_eligible is not False)
+
+    A LINKED relation means the allowlist spot belongs to a *different*
+    (delegated) address - so the wallet we would mint from cannot attempt it,
+    even though OpenSea reports it as eligible. That is what made w11-w16 look
+    mintable. Linked stays a display label, but never a mint attempt."""
+    if st.get("relation") == "linked":
+        return False
+    if st.get("type") == "PUBLIC_SALE":
+        return True
+    return st.get("eligible") is not False
+
+
+def assess_wallet_eligibility(st, probe=None):
+    """Reference rule (osnm command.rs::assess_wallet_eligibility) - the verdict
+    used for REPORTING eligibility. Deliberately stricter than wallet_can_attempt:
+
+        PUBLIC_SALE            -> eligible
+        live probe says yes    -> eligible (verified)
+        live probe says no     -> ineligible
+        is_eligible True       -> eligible (provisional)
+        is_eligible False      -> ineligible
+        is_eligible None       -> UNKNOWN   <- not eligible; must not be listed
+
+    wallet_can_attempt lets None through because it answers "worth trying?".
+    Using it to build the eligible LIST is what made 10/10 look eligible."""
+    if st.get("relation") == "linked":
+        return "linked"
+    if st.get("type") == "PUBLIC_SALE":
+        return "eligible"
+    if probe is True:
+        return "eligible"
+    if probe is False:
+        return "ineligible"
+    e = st.get("eligible")
+    if e is True:
+        return "eligible"
+    if e is False:
+        return "ineligible"
+    return "unknown"
+
+
 def stage_is_live(meta, now=None):
     now = now or time.time()
     s, e = (meta or {}).get("start"), (meta or {}).get("end")
@@ -3664,7 +3710,10 @@ async def os_autoload(update, context, slug):
             stages, minted = await os_retry(os_eligibility,
                                             STATE["os_sessions"][w["name"]], slug, w,
                                             label=w["name"])
-            return w["name"], [s for s in stages if s["eligible"]], None, minted
+            # pass ALL stages through: wallet_can_attempt() decides, and it puts
+            # PUBLIC_SALE ahead of isEligible (a public sale has no allowlist to
+            # be on, so OpenSea often returns null/false there).
+            return w["name"], stages, None, minted
         except Exception as e:
             return w["name"], [], safe(e, 40), None
 
@@ -3672,7 +3721,9 @@ async def os_autoload(update, context, slug):
     elig_map, price_map, max_map, errs = {}, {}, {}, []
     per_wallet_max = {}          # (stage_key, wallet) -> what THAT wallet may mint
     used_up = {}                 # stage_key -> wallets that already minted out
-    refused = {}                 # stage_key -> wallets OpenSea refused when probed
+    refused = {}                 # stage_key -> wallets the live PROBE refused
+    not_listed = {}              # stage_key -> wallets simply not on that list
+    unknown = {}                 # stage_key -> no verdict from OpenSea (isEligible None)
     linked = {}                  # stage_key -> eligible only via a LINKED wallet
     for name, stages, err, minted in results:
         if err:
@@ -3684,9 +3735,11 @@ async def os_autoload(update, context, slug):
             cap = int(s.get("max") or 0)
             allowed = cap
             if cap:
-                # what's LEFT for this wallet, after what it already minted
+                # the already-minted count belongs to the cap owner; for a LINKED
+                # relation that is a different address, so it does not apply here
+                used = 0 if s.get("relation") == "linked" else int(minted or 0)
                 try:
-                    allowed = max(0, cap - int(minted or 0))
+                    allowed = max(0, cap - used)
                 except Exception:
                     allowed = cap
             if cap and allowed <= 0:
@@ -3694,10 +3747,18 @@ async def os_autoload(update, context, slug):
                 # eligible, it would only fail with InsufficientMintsRemaining
                 used_up.setdefault(k, []).append(name)
                 continue
-            if s.get("eligible") is False:
-                continue                       # OpenSea says no outright
-            if s.get("relation") == "linked":
+            verdict = assess_wallet_eligibility(s)
+            if verdict == "linked":
                 linked.setdefault(k, []).append(name)
+                continue
+            if verdict == "ineligible":
+                not_listed.setdefault(k, []).append(name)
+                continue
+            if verdict == "unknown":
+                # no pre-launch verdict from OpenSea - not listed as eligible, but
+                # remembered so a live-stage probe can still resolve it
+                unknown.setdefault(k, []).append(name)
+                continue
             elig_map.setdefault(k, []).append(name)
             if allowed:
                 per_wallet_max[(k, name)] = allowed
@@ -3716,12 +3777,12 @@ async def os_autoload(update, context, slug):
     order = sorted(set(list(elig_map.keys()) + list(used_up.keys())), key=_rank)
     verdicts = {}                       # (stage_key, wallet) -> "verified"/"no"/"provisional"
     probe_targets = []
-    for k, names in elig_map.items():
+    for k in set(list(elig_map.keys()) + list(unknown.keys())):
         if stage_type_of(k) == "PUBLIC_SALE":
             continue
         if not stage_is_live(stage_meta.get(k)):
             continue
-        for n in names:
+        for n in elig_map.get(k, []) + unknown.get(k, []):
             probe_targets.append((k, n))
     if probe_targets:
         await reply(f"Verifying {len(probe_targets)} wallet(s) against the live stage...")
@@ -3736,11 +3797,13 @@ async def os_autoload(update, context, slug):
 
         for k, n, v in await asyncio.gather(*[probe(k, n) for k, n in probe_targets]):
             verdicts[(k, n)] = v
-        # drop the ones OpenSea actively refused
         for (k, n), v in list(verdicts.items()):
             if v == "no" and n in elig_map.get(k, []):
-                elig_map[k].remove(n)
+                elig_map[k].remove(n)                      # refused when checked
                 refused.setdefault(k, []).append(n)
+            elif v == "verified" and n in unknown.get(k, []):
+                unknown[k].remove(n)                       # unknown -> proven eligible
+                elig_map.setdefault(k, []).append(n)
 
 
     STATE["os_ctx"] = {"slug": slug, "coll": coll, "elig": elig_map, "price": price_map,
@@ -3791,9 +3854,12 @@ async def os_autoload(update, context, slug):
         lines.append(f"   [{_conf}]")
         if refused.get(t):
             lines.append(f"   refused when checked: {len(refused[t])} wallet(s)")
+        if unknown.get(t):
+            lines.append(f"   no verdict from OpenSea yet: {len(unknown[t])} wallet(s) "
+                         f"(checked when the stage opens)")
         if linked.get(t):
-            lines.append(f"   via LINKED wallet (may not mint from these): "
-                         f"{', '.join(linked[t][:6])}")
+            lines.append(f"   EXCLUDED - eligible only via a linked/delegated wallet, "
+                         f"cannot mint from these: {', '.join(linked[t][:8])}")
         # name the eligible wallets, and show who's missing out
         by_addr = {w["name"]: w["address"] for w in STATE["wallets"]}
         if len(names) <= 8:
@@ -3809,7 +3875,8 @@ async def os_autoload(update, context, slug):
             lines.append(f"   already minted out: {len(spent_out)} wallet(s)"
                          + (f" ({', '.join(spent_out)})" if len(spent_out) <= 8 else ""))
         missing = [w["name"] for w in ws
-                   if w["name"] not in names and w["name"] not in spent_out]
+                   if w["name"] not in names and w["name"] not in spent_out
+                   and w["name"] not in unknown.get(t, [])]
         if missing and len(missing) <= 8:
             lines.append(f"   not eligible: {', '.join(missing)}")
         elif missing:
